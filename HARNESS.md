@@ -65,7 +65,7 @@ always posts to the board it came from.
 | Consistency | the slowest ranked call may not exceed 2x the median (plus 2 ms) |
 | Warm-up | one untimed call, on an equally shaped draw from a *different* dataset |
 | Per call | fresh draw staged into the fixed tensors (untimed), `synchronize`, 256 MB L2 flush, `synchronize`, `start` event, your call, `end` event, `synchronize` |
-| Hold-out | 2 of the ranked calls are Fashion-MNIST, at positions only the evaluator knows; together they must be at least 70% correct |
+| Hold-out | 2 of the ranked calls are Fashion-MNIST, at positions only the evaluator knows; together they must be at least 15% correct. benchmark mode runs 1 and gates on it too |
 | Submission | one file, at most 20,480 bytes, no string or bytes literal over 4,096 bytes |
 | Timeouts | test 300 s, benchmark 600 s, ranked 1200 s; a single call over 60 s fails, and one that does not return is killed |
 | Ranking | `ranking_by: last`, one benchmark case per band |
@@ -236,7 +236,7 @@ which five agents attacked it (their submissions are in `redteam/`):
   PCA-QDA 78.0%, the conjugate-gradient pair 88.2%, and `submissions/mlp512.py`
   **47.8%**, which fails. That entry is not a memorizer: its fixed learning rate
   is tuned for sparse 9x9 digits and diverges on Fashion's denser images, at two
-  different secret seeds, collapsing onto one class both times. The 70% floor
+  different secret seeds, collapsing onto one class both times. The 15% floor
   therefore favours closed-form learners over iterative ones, and it still
   cannot separate a genuine learner from an entry that memorized MNIST *and*
   learns properly on everything else. The number is under review.

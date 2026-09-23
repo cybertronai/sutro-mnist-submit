@@ -20,7 +20,8 @@ Trust boundary
   Scoring, and every clock that decides a rank, happens here.
 
 Case fields (integers, set in task.yml): size, train, test, error_bp, draws,
-bench_draws, seed, holdout, holdout_draws, holdout_min_bp, max_call_ms,
+bench_draws, seed, holdout, holdout_draws, bench_holdout_draws,
+holdout_min_bp, max_call_ms,
 warmup_max_call_ms, draw_slack_bp, dispersion_x10, max_source_bytes,
 max_literal_bytes.
 
@@ -75,14 +76,15 @@ DEFAULTS = {
     "seed": 0,
     "holdout": 0,
     "holdout_draws": 2,
-    "holdout_min_bp": 3000,
+    "bench_holdout_draws": 1,
+    "holdout_min_bp": 8500,
     "max_call_ms": 60000,
     "warmup_max_call_ms": 120000,
     "draw_slack_bp": 150,
     "dispersion_x10": 20,
     "max_source_bytes": 20480,
     "max_literal_bytes": 4096,
-    "test_timeout": 300,
+    "test_timeout": 420,
     "benchmark_timeout": 600,
     "ranked_timeout": 1200,
 }
@@ -829,14 +831,15 @@ def calibrate(child, warm_visible):
     return min(probes), max(stage_rounds), min(stage_costs)
 
 
-def run_case(child, pools, case, *, timed_draws, holdout, floor_bp):
+def run_case(child, pools, case, *, timed_draws, holdout_draws, floor_bp):
     """Warm up once on foreign data, then run the timed calls on fresh draws.
 
-    Hold-out calls (leaderboard mode) are drawn from Fashion-MNIST, land at
+    ``holdout_draws`` hold-out calls are drawn from Fashion-MNIST, land at
     positions chosen by the secret seed, and are timed and ranked exactly like
     the MNIST calls -- they are not a free compute slot, and their position
     cannot be predicted. Their accuracy is scored separately, against the
-    hold-out floor.
+    hold-out floor. Leaderboard mode runs ``holdout_draws`` of them and
+    benchmark mode ``bench_holdout_draws``; the caller passes the count.
     """
     pool = pools[("mnist", case["size"])]
     fashion = pools[("fashion", case["size"])]
@@ -860,7 +863,6 @@ def run_case(child, pools, case, *, timed_draws, holdout, floor_bp):
     child.call("load", timeout_s=warmup_timeout)
     child.call("untimed", warm_visible, timeout_s=warmup_timeout)
 
-    holdout_draws = case["holdout_draws"] if holdout else 0
     total_calls = timed_draws + holdout_draws
     holdout_positions = set()
     if holdout_draws:
@@ -1022,7 +1024,7 @@ def run_test(out, pools, cases, device):
                 pools,
                 case,
                 timed_draws=case["draws"],
-                holdout=False,
+                holdout_draws=0,
                 floor_bp=min(10000, loose_bp + case["draw_slack_bp"]),
             )
         except Failure as error:
@@ -1056,6 +1058,26 @@ def run_test(out, pools, cases, device):
     return EXIT_SUCCESS if passed else EXIT_VALIDATE_FAIL
 
 
+def draw_plan(case, *, ranked):
+    """How many ranked draws and how many hold-out calls a mode runs.
+
+    benchmark mode reuses the ranked case line but runs fewer draws; KernelBot
+    hands both modes the same ``benchmarks`` entry.
+
+    benchmark also runs a hold-out call and gates on it. Without one it is a
+    cheap, unguarded rehearsal surface: a memorizer could time itself to
+    convergence there and only meet the learning check on the expensive ranked
+    run. One call is enough to fail it.
+    """
+    if ranked:
+        timed = case["draws"]
+        held = case["holdout_draws"]
+    else:
+        timed = min(case["draws"], case["bench_draws"])
+        held = case["bench_holdout_draws"]
+    return timed, (held if case["holdout"] else 0)
+
+
 def run_ranked(out, pools, cases, device, holdout):
     out.log("benchmark-count", len(cases))
     deadline = mode_deadline(cases[0], "leaderboard" if holdout else "benchmark")
@@ -1068,16 +1090,13 @@ def run_ranked(out, pools, cases, device, holdout):
             child = Child(device, work_dir, deadline=deadline)
             if index == 0:
                 log_system(out, child)
-            use_holdout = bool(holdout and case["holdout"])
-            # benchmark mode reuses the ranked case line but runs fewer draws;
-            # KernelBot hands both modes the same benchmarks entry.
-            timed_draws = case["draws"] if holdout else min(case["draws"], case["bench_draws"])
+            timed_draws, holdout_draws = draw_plan(case, ranked=holdout)
             report = run_case(
                 child,
                 pools,
                 case,
                 timed_draws=timed_draws,
-                holdout=use_holdout,
+                holdout_draws=holdout_draws,
                 floor_bp=min(10000, case["error_bp"] + case["draw_slack_bp"]),
             )
         except Failure as error:

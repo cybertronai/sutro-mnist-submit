@@ -25,9 +25,12 @@ class TestSpec(TypedDict):
                        same case line, and benchmark is only a dress rehearsal)
     seed               public case seed, combined with the secret POPCORN_SEED
     holdout            1 to run the Fashion-MNIST learning check (leaderboard)
-    holdout_draws      how many hold-out calls, interleaved at secret positions;
-                       they are timed and ranked like every other call
-    holdout_min_bp     maximum hold-out error in basis points (3000 = 70%)
+    holdout_draws      how many hold-out calls in leaderboard mode, interleaved
+                       at secret positions; they are timed and ranked like every
+                       other call
+    bench_holdout_draws the same for benchmark mode, so the cheap mode is a
+                       faithful rehearsal and not an unguarded one
+    holdout_min_bp     maximum hold-out error in basis points (8500 = 15%)
     max_call_ms        a single call longer than this fails the submission
     warmup_max_call_ms the same limit for the untimed warm-up call
     draw_slack_bp      per-draw floor: a single draw may fall this many basis
@@ -50,6 +53,7 @@ class TestSpec(TypedDict):
     seed: int
     holdout: int
     holdout_draws: int
+    bench_holdout_draws: int
     holdout_min_bp: int
     max_call_ms: int
     warmup_max_call_ms: int

@@ -554,11 +554,13 @@ def test_timeout_floor_counts_every_bounded_call_of_the_mode():
         "bench_draws": 3,
         "holdout": 1,
         "holdout_draws": 2,
+        "bench_holdout_draws": 1,
         "max_call_ms": 60000,
         "warmup_max_call_ms": 120000,
     }
     assert make_bands.timed_calls(settings, "test") == 1
-    assert make_bands.timed_calls(settings, "benchmark") == 3
+    # benchmark runs its own hold-out call, and it is timed like the rest
+    assert make_bands.timed_calls(settings, "benchmark") == 4
     # the hold-out calls are timed and ranked, so they are part of the budget
     assert make_bands.timed_calls(settings, "leaderboard") == 13
 
@@ -578,10 +580,12 @@ def test_a_hold_out_free_band_does_not_reserve_hold_out_calls():
         "bench_draws": 3,
         "holdout": 0,
         "holdout_draws": 2,
+        "bench_holdout_draws": 1,
         "max_call_ms": 60000,
         "warmup_max_call_ms": 120000,
     }
     assert make_bands.timed_calls(settings, "leaderboard") == 11
+    assert make_bands.timed_calls(settings, "benchmark") == 3
 
 
 def test_every_shipped_band_can_afford_its_own_per_call_limit():
@@ -623,3 +627,55 @@ def test_bands_md_publishes_the_mode_budget_table():
     settings = {**config["defaults"], **config["bands"][0]}
     floor = make_bands.timeout_floor(settings, "leaderboard")
     assert f"| {floor} s |" in text
+
+
+# ------------------------------------------------------------------ hold-out policy
+
+def test_benchmark_mode_runs_a_gated_hold_out_call():
+    case = {"draws": 11, "bench_draws": 3, "holdout": 1,
+            "holdout_draws": 2, "bench_holdout_draws": 1}
+    assert harness.draw_plan(case, ranked=True) == (11, 2)
+    # the cheap mode is a faithful rehearsal, not an unguarded one
+    assert harness.draw_plan(case, ranked=False) == (3, 1)
+
+
+def test_a_band_with_the_hold_out_off_runs_none_in_either_mode():
+    case = {"draws": 11, "bench_draws": 3, "holdout": 0,
+            "holdout_draws": 2, "bench_holdout_draws": 1}
+    assert harness.draw_plan(case, ranked=True) == (11, 0)
+    assert harness.draw_plan(case, ranked=False) == (3, 0)
+
+
+def test_benchmark_never_runs_more_ranked_draws_than_the_band_has():
+    case = {"draws": 2, "bench_draws": 3, "holdout": 1,
+            "holdout_draws": 2, "bench_holdout_draws": 1}
+    assert harness.draw_plan(case, ranked=False)[0] == 2
+
+
+def test_the_hold_out_floor_separates_learning_from_memorising():
+    """Every accuracy measured on the A100, against the 15% floor.
+
+    The floor only has to tell a learner from a lookup table. It was 70%, which
+    failed mlp512 -- an honest learner whose hand-tuned learning rate diverges
+    on Fashion's denser images.
+    """
+    floor_bp = json.loads((HERE.parent / "bands.json").read_text())["defaults"]["holdout_min_bp"]
+    total = 2 * 10000  # holdout_draws x test
+    needed = required_correct(total, floor_bp)
+    assert needed == 3000  # 15% of 20,000
+
+    measured = {"pca_qda": 0.774, "cg_pair": 0.882, "mlp512": 0.478, "nearest_class_mean": 0.665}
+    for name, accuracy in measured.items():
+        assert round(accuracy * total) >= needed, f"{name} is an honest learner and must pass"
+    # a lookup table cannot answer a permuted-label foreign dataset: chance is 10%
+    assert round(0.10 * total) < needed
+    # and the separation is wide in units of the noise at chance
+    sigma = (0.10 * 0.90 / total) ** 0.5
+    assert (needed / total - 0.10) / sigma > 20
+
+
+def test_the_case_field_reaches_every_generated_band():
+    for path in sorted((HERE.parent).glob("mnist-medium-*/task.yml")):
+        text = path.read_text()
+        assert '"bench_holdout_draws": 1' in text, path
+        assert '"holdout_min_bp": 8500' in text, path

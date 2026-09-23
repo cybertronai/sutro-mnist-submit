@@ -19,7 +19,7 @@ does not, because then the published per-call limit is not the real one.
 | Mode | Timed calls | Needs | Timeout | Headroom |
 | --- | ---: | ---: | ---: | ---: |
 | `test` | 1 | 360 s | 420 s | 60 s |
-| `benchmark` | 3 | 480 s | 600 s | 120 s |
+| `benchmark` | 4 | 540 s | 600 s | 60 s |
 | `leaderboard` | 13 | 1080 s | 1200 s | 120 s |
 
 Fixed costs: 30 s pool load, 120 s child start-up, 120 s warm-up, 30 s reserve; 60 s per timed call.

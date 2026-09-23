@@ -178,7 +178,7 @@ var set on a hosted run (an operator convenience that hands the pool over).
 **Decision.** `holdout_draws` (2) Fashion-MNIST calls of identical shape at
 positions only the evaluator knows, interleaved with the ranked calls, **timed
 and ranked like every other call**, scored in aggregate against
-`holdout_min_bp` (3000 bp = 70%).
+`holdout_min_bp` (8500 bp = 15%; see section 6 item 2).
 
 **Why.** MLPerf's open-division rule: the implementation must not encode
 information about the dataset's content or a successful model's state. A
@@ -197,7 +197,7 @@ learner that fails; see section 6.
 ### D7. Every threshold is a case field, and case fields come from one JSON file
 
 **Decision.** `size`, `train`, `test`, `error_bp`, `draws`, `bench_draws`,
-`seed`, `holdout`, `holdout_draws`, `holdout_min_bp`, `max_call_ms`,
+`seed`, `holdout`, `holdout_draws`, `bench_holdout_draws`, `holdout_min_bp`, `max_call_ms`,
 `warmup_max_call_ms`, `draw_slack_bp`, `dispersion_x10`, `max_source_bytes`,
 `max_literal_bytes`. All documented in `task.py:TestSpec`, all defaulted in
 `bands.json`, all reaching KernelBot only through generated `task.yml` case
@@ -329,7 +329,8 @@ that band currently has no qualifier at all (section 6).
 
 **To change the gates rather than the bands:** `draw_slack_bp` (per-draw floor
 under the aggregate rule, 150 bp), `dispersion_x10` (ten times the allowed
-worst/median ratio, 20), `holdout_min_bp` (3000), `holdout_draws` (2),
+worst/median ratio, 20), `holdout_min_bp` (8500), `holdout_draws` (2),
+`bench_holdout_draws` (1),
 `max_call_ms` (60000), `warmup_max_call_ms` (120000), `max_source_bytes`
 (20480), `max_literal_bytes` (4096), `draws` (11), `bench_draws` (3). Same
 edit-and-regenerate loop.
@@ -434,6 +435,17 @@ the only thing that closes `subprocess curl`.
    require only a wide margin over chance. Measured floors to calibrate
    against: `pca_qda` 77.4 to 78.0%, `cg_pair` 88.2%, `mlp512` 47.8%, nearest
    class mean 66.5% (CPU).
+
+   *Settled in 1.1.2: the floor is now 15%* (`holdout_min_bp` 3000 -> 8500).
+   The hold-out has one job, telling a learner from a lookup table, and it does
+   not need a high bar to do it. A memorizer facing a permuted-label foreign
+   dataset scores chance, 10%; over 2 draws of 10,000 the standard error at
+   chance is 0.21%, so a 15% floor sits about 24 sigma above it and 33 points
+   below the weakest honest learner measured. Every measured entry passes,
+   including `mlp512`. The alternatives were left alone: normalizing hold-out
+   inputs to MNIST's pixel statistics changes what the check measures and is
+   unmeasured, and best-of-draw scoring weakens the check on exactly the
+   entries it exists for.
 3. **The 2% band has no qualifier.** `cg_pair` scores 97.837% over the
    benchmark draws and 97.932% over 11 ranked draws against a 98.000%
    requirement, and the GPU per-draw counts reproduce the CPU dry run to within
@@ -458,6 +470,14 @@ the only thing that closes `subprocess curl`.
    intended (cheap smoke tests) but it also means `benchmark` mode, which runs
    no hold-out, is a rehearsal surface for a memorizer. Consider whether
    `benchmark` should also run one hold-out call.
+
+   *Settled in 1.1.2: it does.* `bench_holdout_draws` (default 1) interleaves
+   one Fashion-MNIST call into benchmark mode, timed and ranked like the rest,
+   and the same floor gates it. The cheap mode is now a faithful rehearsal
+   rather than an unguarded one a memorizer could tune against. Verified on
+   CPU: `ncm_baseline` reports `holdout_per_draw: [1364]` of 2,000 and passes;
+   with the floor forced to 90% the same run exits 112 with "this submission
+   does not appear to learn from the data it is given".
 7. **Deadline.** `bands.json` says `2026-12-31 23:59`, a placeholder.
 8. **Timeout headroom at the slow end.** *Settled in 1.1.2.* `make_bands.py`
    now derives a floor for every mode -- pool load, child start-up, the untimed

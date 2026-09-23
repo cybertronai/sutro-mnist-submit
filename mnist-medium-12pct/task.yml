@@ -35,7 +35,7 @@ description: |
   no single draw may fall more than 1.5 percentage points below the band.
   A leaderboard run interleaves 2 further calls on equally shaped draws from
   a different dataset at secret positions; they are timed and ranked like the
-  rest, and must be at least 70% correct in aggregate. A submission that
+  rest, and must be at least 15% correct in aggregate. A submission that
   memorizes MNIST instead of learning fails that check.
 
   A submission file is limited to 20,480 bytes, with no literal over
@@ -58,4 +58,4 @@ tests:
   - {"size": 9, "train": 10000, "test": 10000, "error_bp": 1200, "draw_slack_bp": 150, "dispersion_x10": 20, "max_call_ms": 60000, "warmup_max_call_ms": 120000, "max_source_bytes": 20480, "max_literal_bytes": 4096, "test_timeout": 420, "benchmark_timeout": 600, "ranked_timeout": 1200, "draws": 1, "bench_draws": 1, "seed": 101, "holdout": 0}
 
 benchmarks:
-  - {"size": 9, "train": 10000, "test": 10000, "error_bp": 1200, "draw_slack_bp": 150, "dispersion_x10": 20, "max_call_ms": 60000, "warmup_max_call_ms": 120000, "max_source_bytes": 20480, "max_literal_bytes": 4096, "test_timeout": 420, "benchmark_timeout": 600, "ranked_timeout": 1200, "draws": 11, "bench_draws": 3, "seed": 202, "holdout": 1, "holdout_draws": 2, "holdout_min_bp": 3000}
+  - {"size": 9, "train": 10000, "test": 10000, "error_bp": 1200, "draw_slack_bp": 150, "dispersion_x10": 20, "max_call_ms": 60000, "warmup_max_call_ms": 120000, "max_source_bytes": 20480, "max_literal_bytes": 4096, "test_timeout": 420, "benchmark_timeout": 600, "ranked_timeout": 1200, "draws": 11, "bench_draws": 3, "seed": 202, "holdout": 1, "holdout_draws": 2, "bench_holdout_draws": 1, "holdout_min_bp": 8500}

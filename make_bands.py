@@ -53,7 +53,8 @@ def timed_calls(settings: dict, mode: str) -> int:
     if mode == "test":
         return 1
     if mode == "benchmark":
-        return min(settings["draws"], settings["bench_draws"])
+        calls = min(settings["draws"], settings["bench_draws"])
+        return calls + (settings["bench_holdout_draws"] if settings["holdout"] else 0)
     if mode == "leaderboard":
         return settings["draws"] + (settings["holdout_draws"] if settings["holdout"] else 0)
     raise ValueError(mode)
@@ -233,6 +234,7 @@ def render(config: dict) -> dict[str, str]:
                 "seed": settings["benchmark_seed"],
                 "holdout": settings["holdout"],
                 "holdout_draws": settings["holdout_draws"],
+                "bench_holdout_draws": settings["bench_holdout_draws"],
                 "holdout_min_bp": settings["holdout_min_bp"],
             }
         )
