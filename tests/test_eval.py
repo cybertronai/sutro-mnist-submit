@@ -679,3 +679,39 @@ def test_the_case_field_reaches_every_generated_band():
         text = path.read_text()
         assert '"bench_holdout_draws": 1' in text, path
         assert '"holdout_min_bp": 8500' in text, path
+
+
+# ------------------------------------------------------------------ deadline
+
+def test_the_shipped_deadline_parses_and_reaches_the_competition_file():
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    import datetime as dt
+
+    when = dt.datetime.strptime(config["deadline"], make_bands.DEADLINE_FORMAT)
+    assert when.year >= 2026
+    assert f'deadline: "{config["deadline"]}"' in (HERE.parent / "sutro.yaml").read_text()
+
+
+def test_a_malformed_deadline_is_fatal_and_a_past_one_is_a_warning():
+    import datetime as dt
+
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    assert make_bands.check_deadline(config, dt.datetime(2026, 1, 1)) == []
+
+    past = make_bands.check_deadline(config, dt.datetime(2099, 1, 1))
+    assert len(past) == 1 and past[0].endswith("(warning)")
+
+    config["deadline"] = "31/12/2026"
+    bad = make_bands.check_deadline(config, dt.datetime(2026, 1, 1))
+    assert len(bad) == 1 and not bad[0].endswith("(warning)")
+
+
+def test_make_bands_refuses_a_malformed_deadline(tmp_path, monkeypatch, capsys):
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    config["deadline"] = "whenever"
+    (tmp_path / "bands.json").write_text(json.dumps(config))
+    monkeypatch.setattr(make_bands, "HERE", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["make_bands.py"])
+    assert make_bands.main() == 1
+    assert "deadline" in capsys.readouterr().out
+    assert not (tmp_path / "sutro.yaml").exists()

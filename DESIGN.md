@@ -5,7 +5,9 @@ Harness `sutro-mnist-medium-time/1.1.2`, 2026-09-23. Reader: Yaroslav.
 1.1.1, so times measured under either version stay comparable.
 Section 10 lists the changes an independent audit of 1.1.0 produced; every
 number measured on hardware below was taken with 1.1.0 and is unaffected by
-them, except where section 10 says otherwise.
+them, except where section 10 says otherwise. Section 11 lists what 1.1.2
+changed: gates, budgets and the site, never the timed path, so every measured
+number below still stands.
 Source of every number below: `gpumode/results/gpu-*.json` (one A100 on Modal,
 25 sequential containers, 1923 s = 32.1 min of GPU wall time) and
 `gpumode/results/cpu-*.json` (CPU dry runs). Code: `gpumode/eval.py`,
@@ -455,15 +457,31 @@ the only thing that closes `subprocess curl`.
    not of 110k, so re-seeding moves the number by tenths of a point rather than
    averaging the miss away. Either open 2% knowing its only known entry misses,
    or move the band. The 1.6% band under discussion is further still.
-4. **Mean or median as the ranked value.** Currently mean, matching KernelBot.
-   Measured within-run std is 0.2 to 0.4% for every honest entry, so it makes
-   almost no difference today; median is more robust if a band ever admits an
-   entry with a bimodal call.
-5. **Should compile and graph capture stay untimed?** D3 says yes, and it costs
-   a foreign-dataset warm-up call to keep safe. The alternative, timing the
-   first call, would rank `torch.compile` rather than the learner and would make
-   CUDA-graph entries look terrible. Worth a deliberate answer since the answer
-   is what the board actually measures.
+
+   **Still yours.** It is a competition question, not a harness one, and the
+   harness does not care which number sits there. Moving it is one line in
+   `bands.json` (`"error_bp": 200` -> e.g. `220`) followed by `make_bands.py`;
+   adding a band is one more object in `bands[]`. What the harness now does is
+   refuse to generate a band it cannot honour, so whichever way you go the
+   generated `task.yml` stays consistent with what the evaluator enforces.
+4. **Mean or median as the ranked value.** *Settled: mean, deliberately.* It
+   is what KernelBot's `ranking_by: last` reads, so the board renders with no
+   change on Mark's side, and measured within-run std is 0.2 to 0.4% for every
+   honest entry, which makes the two indistinguishable today. The robustness
+   argument for median is already covered from the other end: `dispersion_x10`
+   fails a run whose worst call is more than 2x its median, so an entry with a
+   bimodal call does not get ranked at all rather than getting a kinder
+   statistic. Every run reports `mean`, `median`, `std`, `best` and `worst`,
+   and the site shows all of them, so switching later needs no re-measurement.
+5. **Should compile and graph capture stay untimed?** *Settled: yes, untimed.*
+   Timing the first call would rank `torch.compile` rather than the learner,
+   and would make CUDA-graph entries -- the ones the competition exists to
+   encourage -- look worst. The thing that makes it safe is not the untimed
+   call but D3's foreign warm-up: the free call is on Fashion-MNIST, so a model
+   fitted there is about the wrong dataset and training cannot be moved out of
+   the timed window. Before that, the red team turned the free call into a free
+   training budget worth 2.71x and 9.4x. This is the answer the board measures;
+   it is stated in every `task.yml` description so no submitter has to infer it.
 6. **Test mode on the public seed.** `test_seed: 101` and `benchmark_seed: 202`
    are public and combined with the secret, so nobody can precompute a draw, but
    a participant can rehearse against a fixed public case repeatedly. That is
@@ -478,7 +496,12 @@ the only thing that closes `subprocess curl`.
    CPU: `ncm_baseline` reports `holdout_per_draw: [1364]` of 2,000 and passes;
    with the floor forced to 90% the same run exits 112 with "this submission
    does not appear to learn from the data it is given".
-7. **Deadline.** `bands.json` says `2026-12-31 23:59`, a placeholder.
+7. **Deadline.** `bands.json` says `2026-12-31 23:59`, a placeholder, and it
+   is still yours to set: it goes to KernelBot in `sutro.yaml` and only you
+   know when the board should close. What 1.1.2 adds is that `make_bands.py`
+   now parses it -- a malformed date is fatal rather than reaching KernelBot as
+   a string it cannot read -- and prints a warning once the date has passed, so
+   a stale competition file cannot regenerate silently.
 8. **Timeout headroom at the slow end.** *Settled in 1.1.2.* `make_bands.py`
    now derives a floor for every mode -- pool load, child start-up, the untimed
    warm-up, every timed call at `max_call_ms`, and `MODE_RESERVE_S` -- and
@@ -846,3 +869,35 @@ properly; the README's CPU smoke-test command used a band the baseline cannot
 clear; two "current board" rows quoted numbers from a different band's result
 and now say "not run"; `tests/test_web.py` skips without `fastapi`; and
 `bands.json` no longer says the hold-out floor is CPU-only calibration.
+
+## 11. Changes in 1.1.2
+
+Everything here changes a gate, a budget or the site. The timed path -- the
+staging round trip, the L2 flush, the CUDA events, the four clocks, the
+plausibility bounds -- is byte-identical to 1.1.1, so every number measured in
+sections 1, 3 and 7 still stands and times are comparable across the two.
+
+| # | Open decision | Outcome |
+| --- | --- | --- |
+| 1 | 40 GB vs 80 GB A100 | partly settled: the site shows the board on every row and warns when two appear. Pinning the variant still needs Mark |
+| 2 | Hold-out floor rejects an honest learner | settled: floor 70% -> 15% (`holdout_min_bp` 3000 -> 8500) |
+| 3 | The 2% band has no qualifier | yours: one line in `bands.json` |
+| 4 | Mean or median | settled: mean, and `dispersion_x10` already covers the robustness case |
+| 5 | Compile and graph capture untimed | settled: yes, kept safe by the foreign warm-up |
+| 6 | `benchmark` is an unguarded rehearsal | settled: `bench_holdout_draws` (1), gated by the same floor |
+| 7 | Deadline is a placeholder | yours: the date. The harness now parses it and warns once it has passed |
+| 8 | Timeout headroom at the slow end | settled: a generated floor per mode, and `test_timeout` 300 -> 420 s |
+
+New case field: `bench_holdout_draws`. Changed defaults: `holdout_min_bp`
+3000 -> 8500, `test_timeout` 300 -> 420. Changed site constant:
+`GPU_TIMEOUT_S` 2400 -> 3000, so the container backstop never truncates the
+step budgets a `task.yml` publishes.
+
+New in `make_bands.py`: `timeout_floor()` and `check_timeouts()`, which refuse
+to generate a band whose mode timeout cannot cover its own `max_call_ms`, and
+`check_deadline()`. Both `--check` and the write path enforce them.
+
+New on the site: optional GitHub sign-in (off by default; DEPLOY.md section
+4a), the board column and the mixed-hardware banner.
+
+The suite is 111 tests, up from 78 at 1.1.1.

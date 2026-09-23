@@ -12,6 +12,7 @@ followed by one run of this script.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import math
 import shutil
@@ -70,6 +71,27 @@ def timeout_floor(settings: dict, mode: str) -> int:
         + MODE_RESERVE_S
     )
     return math.ceil(seconds)
+
+
+DEADLINE_FORMAT = "%Y-%m-%d %H:%M"
+
+
+def check_deadline(config: dict, now: dt.datetime | None = None) -> list[str]:
+    """The deadline goes to KernelBot in sutro.yaml. A malformed one is fatal;
+    one that has already passed is a warning, because regenerating a finished
+    competition's files is legitimate."""
+    problems = []
+    for name, value in [("competition", config["deadline"])] + [
+        (band["name"], band["deadline"]) for band in config["bands"] if "deadline" in band
+    ]:
+        try:
+            when = dt.datetime.strptime(value, DEADLINE_FORMAT)
+        except (TypeError, ValueError):
+            problems.append(f"{name}: deadline {value!r} is not '{DEADLINE_FORMAT}'")
+            continue
+        if when < (now or dt.datetime.now()):
+            problems.append(f"{name}: deadline {value} has already passed (warning)")
+    return problems
 
 
 TIMEOUT_FIELD = {
@@ -376,6 +398,13 @@ def main() -> int:
     # A band whose mode timeout cannot cover its own max_call_ms publishes a
     # per-call limit it does not enforce. Refuse to generate it either way:
     # --check must fail, and a plain run must not write the bad task.yml.
+    fatal = False
+    for line in check_deadline(config):
+        print("deadline: " + line)
+        fatal = fatal or not line.endswith("(warning)")
+    if fatal:
+        return 1
+
     broken = check_timeouts(config)
     if broken:
         for line in broken:
