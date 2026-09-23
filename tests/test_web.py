@@ -680,3 +680,46 @@ def test_the_container_backstop_never_truncates_the_evaluator():
                 f"{uncapped:.0f} s of step budget to {deadline_seconds(task, mode):.0f} s"
             )
             assert worst_case_seconds(task, mode) <= site_app.GPU_TIMEOUT_S
+
+
+# ------------------------------------------------------------------ board variants
+
+def test_board_label_reduces_a_device_name_to_its_capacity():
+    assert site_app.board_label("NVIDIA A100-SXM4-40GB") == "40GB"
+    assert site_app.board_label("NVIDIA A100-SXM4-80GB") == "80GB"
+    assert site_app.board_label("NVIDIA A100 80GB PCIe") == "80GB"
+    assert site_app.board_label(None) is None
+    assert site_app.board_label("   ") is None
+    # an unrecognised name still identifies the board rather than vanishing
+    assert site_app.board_label("NVIDIA H100") == "NVIDIA H100"
+
+
+def test_only_runs_with_a_ranked_time_count_towards_the_board_set():
+    items = [
+        {"gpu": "NVIDIA A100-SXM4-40GB", "summary": {"mean_ms": 4.5}},
+        {"gpu": "NVIDIA A100-SXM4-80GB", "summary": {"mean_ms": None}},  # no time yet
+        {"gpu": None, "summary": {"mean_ms": 9.0}},
+    ]
+    assert site_app.boards_in(items) == ["40GB"]
+
+
+def test_a_single_board_gets_no_warning_and_two_boards_do():
+    one = [{"gpu": "NVIDIA A100-SXM4-40GB", "summary": {"mean_ms": 4.5}}]
+    assert site_app.board_warning(one) == ""
+    two = one + [{"gpu": "NVIDIA A100-SXM4-80GB", "summary": {"mean_ms": 4.3}}]
+    warning = site_app.board_warning(two)
+    assert "Mixed hardware" in warning and "40GB" in warning and "80GB" in warning
+
+
+def test_the_index_shows_the_board_column_and_warns_on_mixed_hardware(client, site, fake):
+    for index, gpu in enumerate(("NVIDIA A100-SXM4-40GB", "NVIDIA A100-SXM4-80GB")):
+        site.save({
+            "id": f"bd{index}", "status": "passed", "name": "ann", "band": "mnist-medium-5pct",
+            "mode": "leaderboard", "created_at": site_app.utcnow(), "gpu": gpu,
+            "reserved_usd": 2.0, "charged_usd": 0.07,
+            "summary": {"mean_ms": 4.5 - 0.2 * index, "accuracy_pct": 95.3, "verdict": "pass"},
+        })
+    body = client.get(f"/{site.token()}").text
+    assert "<th>board</th>" in body
+    assert ">40GB<" in body and ">80GB<" in body
+    assert "Mixed hardware" in body

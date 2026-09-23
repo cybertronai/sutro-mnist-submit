@@ -755,6 +755,7 @@ label{display:block;margin:.6rem 0 .2rem;font-weight:600} input[type=text],selec
 .bar span{display:block;height:100%;background:#3b7ddd}
 .ok{color:#137333;font-weight:600} .bad{color:#c5221f;font-weight:600} .wait{color:#8a6d00;font-weight:600}
 .err{background:#fdecea;border:1px solid #f5c6c2;padding:.75rem 1rem;border-radius:6px}
+.warn{background:#fff8e1;border:1px solid #f0d58c;padding:.75rem 1rem;border-radius:6px;margin:1rem 0}
 button{font-size:15px;padding:.45rem 1rem;margin-top:1rem} small,.muted{color:#666}
 """
 
@@ -821,6 +822,49 @@ def budget_block(book: dict) -> str:
     )
 
 
+# Modal's gpu="A100" is fulfilled with either a 40 GB or an 80 GB SXM4 board.
+# The same computation measured 4.311 ms on the 80 GB card against 4.504-4.547 ms
+# on five separate 40 GB containers: 4.5% apart, about 20x the within-run spread
+# and 5x the cross-container spread. Two entries that landed on different boards
+# therefore cannot be ranked against each other, so the board is shown on every
+# row and the page says so out loud as soon as more than one appears.
+BOARD_PATTERN = re.compile(r"(\d+)\s*GB", re.IGNORECASE)
+
+
+def board_label(gpu: object) -> str | None:
+    """Short name for the board a run landed on, e.g. '40GB'."""
+    if not isinstance(gpu, str) or not gpu.strip():
+        return None
+    matched = BOARD_PATTERN.search(gpu)
+    return f"{matched[1]}GB" if matched else gpu.strip()[:24]
+
+
+def boards_in(items: list[dict]) -> list[str]:
+    """Every distinct board among runs that produced a ranked time, sorted."""
+    seen = set()
+    for record in items:
+        summary = record.get("summary") or {}
+        if summary.get("mean_ms") is None:
+            continue
+        label = board_label(record.get("gpu"))
+        if label:
+            seen.add(label)
+    return sorted(seen)
+
+
+def board_warning(items: list[dict]) -> str:
+    boards = boards_in(items)
+    if len(boards) < 2:
+        return ""
+    return (
+        "<div class='warn'><b>Mixed hardware.</b> These runs landed on more than one "
+        f"A100 board ({', '.join(esc(b) for b in boards)}). The same computation is about "
+        "4.5% faster on the 80 GB card than on the 40 GB card, which is roughly 20x the "
+        "run-to-run spread, so times are comparable only within one board. Compare the "
+        "<b>board</b> column before reading anything into a ranking.</div>"
+    )
+
+
 def queue_positions(items: list[dict]) -> dict:
     queue = [r["id"] for r in sorted(items, key=lambda r: r["id"]) if r["status"] in PENDING]
     return {sid: index for index, sid in enumerate(queue)}
@@ -841,12 +885,13 @@ def submissions_table(items: list[dict], base: str) -> str:
             f"<td>{esc(str(record.get('band', '')).replace('mnist-medium-', ''))}</td><td>{esc(record.get('mode'))}</td>"
             f"<td>{status_cell(record, positions.get(record['id']))}</td>"
             f"<td class='num'>{fmt(summary.get('mean_ms'))}</td>"
+            f"<td>{esc(board_label(record.get('gpu')) or '')}</td>"
             f"<td class='num'>{fmt(summary.get('accuracy_pct'), 2, '%')}</td>"
             f"<td class='num'>{cost}{'' if final else '<br><small>reserved</small>'}</td></tr>"
         )
     return (
         "<table><tr><th>id</th><th>submitted (UTC)</th><th>name</th><th>band</th><th>mode</th><th>status</th>"
-        "<th class='num'>mean ms</th><th class='num'>accuracy</th><th class='num'>cost</th></tr>"
+        "<th class='num'>mean ms</th><th>board</th><th class='num'>accuracy</th><th class='num'>cost</th></tr>"
         + "".join(rows) + "</table>"
     )
 
@@ -877,6 +922,7 @@ is timed with CUDA events over fresh secret draws; the accuracy on those same dr
 Rules and the interface are in the template below and in the
 <a href="https://github.com/cybertronai/sutro-problems/tree/main/mnist">MNIST problem page</a>.</p>
 {budget_block(book)}
+{board_warning(items)}
 {error_block}
 <form method="post" action="{base}/submit" enctype="multipart/form-data">
 <label for="name">Your name or handle</label>

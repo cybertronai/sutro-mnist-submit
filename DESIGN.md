@@ -410,6 +410,15 @@ the only thing that closes `subprocess curl`.
    or record `system.device` and refuse to rank across variants; or accept a
    4.5% noise floor. Worth raising with Mark directly, since it is a property
    of the KernelBot runner, not of this harness.
+
+   *Partly settled in 1.1.2, on the site.* Pinning the variant still needs
+   Mark, because `ModalGPU.A100` is the bare string on KernelBot's side. What
+   the site no longer does is hide the split: every row in the results table
+   carries a **board** column, and as soon as two boards appear among the runs
+   that produced a ranked time the page says, in a banner, that times are
+   comparable only within one board and quotes the measured 4.5%. That turns a
+   silent ranking error into a visible one. The harness already recorded
+   `system.device`; nothing was being done with it.
 2. **The hold-out floor rejects an honest learner.** `mlp512` scores 96.4% on
    MNIST over 11 draws and then fails at 47.79% on Fashion, with per-draw
    `[8548, 1010]` at seed 20260922 and `[8463, 1010]` at seed 777. The same
