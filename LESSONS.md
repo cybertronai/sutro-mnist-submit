@@ -193,6 +193,20 @@ truth.
 - **Expect the harness to move while you work.** Files changed under the
   site three times in one afternoon. Reusing the harness's code instead of
   copying it turned that from a hazard into a redeploy.
+- **An optional Modal secret has to be opted into at deploy time.**
+  `modal.Secret.from_name` on a secret that does not exist fails the whole
+  deploy, so a feature that *may* need credentials cannot just reference them
+  and hope. `SUTRO_GITHUB_OAUTH=1` decides whether the secret is attached at
+  all, which keeps a workspace that never created one deploying exactly as
+  before.
+- **Keep the secret link out of any OAuth `redirect_uri`.** GitHub logs the
+  redirect it was given. A callback under `/<token>/...` would hand the link
+  to a third party's logs; the callback here carries no token and the session
+  it grants is worthless without the link. The `state` is HMAC-signed and
+  expires, so the callback only accepts a round trip the site started.
+- **Rotating the link and signing people out are different operations.**
+  Sharing one key for both means every link rotation logs everyone out, and
+  every logout invalidates the link. Two keys, stored separately.
 - **Never put the token in code, docs or commit messages.** It lives only in
   the records Dict and is printed by `::link`; rotate it if it leaks.
 

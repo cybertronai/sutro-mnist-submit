@@ -723,3 +723,155 @@ def test_the_index_shows_the_board_column_and_warns_on_mixed_hardware(client, si
     assert "<th>board</th>" in body
     assert ">40GB<" in body and ">80GB<" in body
     assert "Mixed hardware" in body
+
+
+# ------------------------------------------------------------------ github sign-in
+
+KEY = "k" * 43
+
+
+def an_identity(allowed="", login="octocat"):
+    return site_app.Identity("cid", "csecret", KEY, allowed, exchange=lambda code, uri: login)
+
+
+@pytest.fixture
+def auth_client(site):
+    from fastapi.testclient import TestClient
+
+    return TestClient(site_app.build_api(site, TEMPLATE, an_identity()))
+
+
+def test_sign_in_is_off_unless_both_oauth_halves_are_present():
+    assert not site_app.Identity().enabled
+    assert not site_app.Identity("cid", "", KEY).enabled
+    assert not site_app.Identity("", "csecret", KEY).enabled
+    assert not site_app.Identity("cid", "csecret", "").enabled  # no signing key yet
+    assert an_identity().enabled
+
+
+def test_a_disabled_site_behaves_exactly_as_before(client, site):
+    body = client.get(f"/{site.token()}").text
+    assert "Sign in with GitHub" not in body and "Signed in as" not in body
+    assert client.get(f"/{site.token()}/login").status_code in (200, 303)
+    assert client.get("/auth/callback").status_code == 404
+    # and a submission still goes through with no account at all
+    response = client.post(f"/{site.token()}/submit",
+                           data={"name": "ann", "band": "mnist-medium-3pct",
+                                 "mode": "test", "source": TEMPLATE}, follow_redirects=False)
+    assert response.status_code == 303
+
+
+def test_signed_blobs_survive_only_their_own_key_and_lifetime():
+    blob = site_app.mint(KEY, "octocat", 1000.0)
+    assert site_app.read_signed(KEY, blob, 100, 1050.0) == "octocat"
+    assert site_app.read_signed(KEY, blob, 100, 1500.0) is None  # expired
+    assert site_app.read_signed("other" * 9, blob, 100, 1050.0) is None  # wrong key
+    assert site_app.read_signed(KEY, blob.replace("octocat", "root"), 100, 1050.0) is None
+    assert site_app.read_signed(KEY, "garbage", 100, 1050.0) is None
+    assert site_app.read_signed(KEY, None, 100, 1050.0) is None
+    # a non-ASCII cookie must not reach compare_digest, which raises on one
+    assert site_app.read_signed(KEY, "café.1000.deadbeef", 100, 1050.0) is None
+    # a clock that runs backwards a little is tolerated, a lot is not
+    assert site_app.read_signed(KEY, blob, 100, 990.0) == "octocat"
+    assert site_app.read_signed(KEY, blob, 100, 800.0) is None
+
+
+def test_the_callback_rejects_a_state_it_did_not_mint():
+    identity = an_identity()
+    _, state = identity.start("https://x/auth/callback", 1000.0)
+    assert identity.finish("code", state, "https://x/auth/callback", 1001.0) == "octocat"
+    with pytest.raises(ValueError, match="did not come from this site"):
+        identity.finish("code", "forged.1000.aaaa", "https://x/auth/callback", 1001.0)
+    with pytest.raises(ValueError, match="did not come from this site"):
+        identity.finish("code", state, "https://x/auth/callback", 1000.0 + site_app.STATE_MAX_AGE_S + 5)
+    with pytest.raises(ValueError, match="authorisation code"):
+        identity.finish("", state, "https://x/auth/callback", 1001.0)
+
+
+def test_the_allowlist_and_the_login_shape_are_both_enforced():
+    _, state = an_identity().start("https://x/auth/callback", 1000.0)
+    allowed = site_app.Identity("cid", "csecret", KEY, "OctoCat, hubot",
+                                exchange=lambda c, u: "octocat")
+    assert allowed.finish("code", state, "https://x/auth/callback", 1001.0) == "octocat"
+    blocked = site_app.Identity("cid", "csecret", KEY, "hubot", exchange=lambda c, u: "octocat")
+    with pytest.raises(ValueError, match="allowlist"):
+        blocked.finish("code", state, "https://x/auth/callback", 1001.0)
+    junk = site_app.Identity("cid", "csecret", KEY, exchange=lambda c, u: "not a login!")
+    with pytest.raises(ValueError, match="no usable login"):
+        junk.finish("code", state, "https://x/auth/callback", 1001.0)
+
+
+def test_an_unsigned_visitor_is_told_to_sign_in_and_cannot_spend(auth_client, site):
+    body = auth_client.get(f"/{site.token()}").text
+    assert "Sign in with GitHub" in body
+    response = auth_client.post(f"/{site.token()}/submit",
+                                data={"name": "ann", "band": "mnist-medium-3pct",
+                                      "mode": "test", "source": TEMPLATE}, follow_redirects=False)
+    assert response.status_code == 403
+    assert "sign in with GitHub" in response.text
+    assert site.submissions() == []  # no record, so no reservation and no GPU
+
+
+def test_a_signed_in_visitor_submits_and_the_record_carries_the_login(auth_client, site):
+    auth_client.cookies.set(site_app.SESSION_COOKIE, site_app.mint(KEY, "octocat", time.time()))
+    body = auth_client.get(f"/{site.token()}").text
+    assert "Signed in as" in body and "octocat" in body
+    response = auth_client.post(f"/{site.token()}/submit",
+                                data={"name": "ann", "band": "mnist-medium-3pct",
+                                      "mode": "test", "source": TEMPLATE}, follow_redirects=False)
+    assert response.status_code == 303
+    record = site.submissions()[0]
+    assert record["github"] == "octocat"
+    assert "@octocat" in auth_client.get(f"/{site.token()}").text
+
+
+def test_a_forged_cookie_does_not_sign_anyone_in(auth_client, site):
+    auth_client.cookies.set(site_app.SESSION_COOKIE, "octocat.9999999999.deadbeef")
+    assert "Sign in with GitHub" in auth_client.get(f"/{site.token()}").text
+    assert auth_client.post(f"/{site.token()}/submit",
+                            data={"name": "ann", "band": "mnist-medium-3pct",
+                                  "mode": "test", "source": TEMPLATE}).status_code == 403
+
+
+def test_the_login_route_sends_the_browser_to_github_without_the_secret_link(auth_client, site):
+    token = site.token()
+    response = auth_client.get(f"/{token}/login", follow_redirects=False)
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert location.startswith(site_app.GITHUB_AUTHORIZE_URL)
+    assert "state=" in location and "client_id=cid" in location
+    # the secret token must not travel to GitHub, in the redirect_uri or anywhere else
+    assert token not in location
+    assert "%2Fauth%2Fcallback" in location or "/auth/callback" in location
+    # and the route itself is still behind the link
+    assert auth_client.get("/not-the-token/login").status_code == 404
+
+
+def test_a_successful_callback_sets_a_session_and_lands_on_the_link(auth_client, site):
+    start = auth_client.get(f"/{site.token()}/login", follow_redirects=False)
+    state = start.headers["location"].split("state=")[1].split("&")[0]
+    response = auth_client.get(f"/auth/callback?code=abc&state={state}", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/{site.token()}"
+    cookie = response.cookies[site_app.SESSION_COOKIE]
+    assert site_app.read_signed(KEY, cookie, site_app.SESSION_MAX_AGE_S, time.time()) == "octocat"
+
+
+def test_a_failed_callback_explains_itself_and_sets_nothing(auth_client):
+    response = auth_client.get("/auth/callback?code=abc&state=forged.1.aa", follow_redirects=False)
+    assert response.status_code == 400
+    assert "Sign-in failed" in response.text
+    assert site_app.SESSION_COOKIE not in response.cookies
+
+
+def test_signing_out_clears_the_session(auth_client, site):
+    auth_client.cookies.set(site_app.SESSION_COOKIE, site_app.mint(KEY, "octocat", time.time()))
+    response = auth_client.get(f"/{site.token()}/logout", follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"] == f"/{site.token()}"
+    assert response.headers["set-cookie"].startswith(f"{site_app.SESSION_COOKIE}=")
+
+
+def test_rotating_the_link_does_not_sign_everybody_out(site):
+    key = site.session_key()
+    site.rotate_token()
+    assert site.session_key() == key

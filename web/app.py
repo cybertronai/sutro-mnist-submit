@@ -47,6 +47,8 @@ Other owner commands:
 
 import ast
 import datetime as dt
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -58,6 +60,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 from pathlib import Path
 
 import modal
@@ -449,6 +452,16 @@ class Site:
             self.store.put("config:token", token)
         return token
 
+    def session_key(self) -> str:
+        """Key for the sign-in cookie and the OAuth state. Rotating the token
+        deliberately does not rotate this: a link rotation should not sign
+        everyone out, and a leaked cookie is bounded by SESSION_MAX_AGE_S."""
+        key = self.store.get("config:session_key")
+        if not key:
+            key = secrets.token_urlsafe(32)
+            self.store.put("config:session_key", key)
+        return key
+
     def rotate_token(self) -> str:
         token = secrets.token_urlsafe(18)
         self.store.put("config:token", token)
@@ -567,7 +580,8 @@ class Site:
         self._write_off(record, reason, "cancelled")
         return record
 
-    def submit(self, name: str, band: str, mode: str, source: str) -> tuple[dict | None, str | None]:
+    def submit(self, name: str, band: str, mode: str, source: str,
+               github: str | None = None) -> tuple[dict | None, str | None]:
         """Validate, reserve budget, persist, spawn. Returns (record, rejection)."""
         if band not in BANDS:
             return None, f"unknown band {band!r}"
@@ -600,6 +614,7 @@ class Site:
                 "deadline_s": deadline_seconds(task, mode),
                 "charged_usd": None,
                 "call_id": None,
+                "github": github,
             }
             # Reserve first: the record (and its reservation) exists before any GPU is asked for.
             self.blobs.put(f"src:{record['id']}", source)
@@ -618,6 +633,145 @@ class Site:
 
 
 # ------------------------------------------------------------------ worker
+
+
+# ------------------------------------------------------------------ identity
+#
+# The secret link is the only gate by default, and that is all the challenge
+# needs while it is shared by hand. What the link cannot do is say who spent
+# the budget: anyone holding it can burn the whole cap anonymously, and a link
+# that leaks cannot be attributed, only rotated.
+#
+# So GitHub login is optional and OFF unless a Modal secret named by
+# GITHUB_SECRET_NAME provides GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET. With
+# no secret every route behaves exactly as before. With one, a submitter signs
+# in before spending anything and the record carries their login.
+#
+# GITHUB_ALLOWED_LOGINS, if set, is a comma-separated allowlist; empty means
+# any GitHub account.
+GITHUB_SECRET_NAME = "sutro-mnist-github-oauth"
+GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
+GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GITHUB_USER_URL = "https://api.github.com/user"
+SESSION_COOKIE = "sutro_id"
+SESSION_MAX_AGE_S = 7 * 24 * 3600
+STATE_MAX_AGE_S = 600
+LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+
+# Attaching a Modal secret that does not exist fails the deploy, so sign-in is
+# opted into explicitly at deploy time:
+#     modal secret create sutro-mnist-github-oauth \
+#         GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=...
+#     SUTRO_GITHUB_OAUTH=1 uvx modal deploy web/app.py
+# Without it the deploy is byte-for-byte what it was and the link is the only gate.
+GITHUB_OAUTH_ENABLED = os.environ.get("SUTRO_GITHUB_OAUTH", "").lower() not in ("", "0", "false", "no")
+GITHUB_SECRETS = [modal.Secret.from_name(GITHUB_SECRET_NAME)] if GITHUB_OAUTH_ENABLED else []
+
+
+def sign(key: str, message: str) -> str:
+    return hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def mint(key: str, payload: str, issued: float) -> str:
+    """A tamper-evident 'payload.issued.signature' blob for a cookie or a state."""
+    body = f"{payload}.{int(issued)}"
+    return f"{body}.{sign(key, body)}"
+
+
+def read_signed(key: str, blob: object, max_age_s: float, now: float) -> str | None:
+    """The payload of a blob this key signed and that has not expired, else None."""
+    if not isinstance(blob, str) or not blob.isascii():
+        return None  # compare_digest raises TypeError on non-ASCII str
+    parts = blob.split(".")
+    if len(parts) != 3:
+        return None
+    payload, issued, signature = parts
+    if not hmac.compare_digest(signature, sign(key, f"{payload}.{issued}")):
+        return None
+    try:
+        age = now - int(issued)
+    except ValueError:
+        return None
+    if age < -60 or age > max_age_s:  # tolerate a little clock skew
+        return None
+    return payload
+
+
+class Identity:
+    """GitHub sign-in, or a disabled stand-in when no OAuth secret is present."""
+
+    def __init__(self, client_id: str = "", client_secret: str = "", signing_key: str = "",
+                 allowed: str = "", exchange=None):
+        self.client_id = (client_id or "").strip()
+        self.client_secret = (client_secret or "").strip()
+        self.signing_key = signing_key
+        self.allowed = {name.strip().lower() for name in (allowed or "").split(",") if name.strip()}
+        self._exchange = exchange or self._github_exchange
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.client_id and self.client_secret and self.signing_key)
+
+    def permits(self, login: str) -> bool:
+        return not self.allowed or login.lower() in self.allowed
+
+    def start(self, redirect_uri: str, now: float) -> tuple[str, str]:
+        """The GitHub URL to send the browser to, and the state that guards it."""
+        state = mint(self.signing_key, secrets.token_urlsafe(9), now)
+        query = urllib.parse.urlencode({
+            "client_id": self.client_id,
+            "redirect_uri": redirect_uri,
+            "scope": "read:user",
+            "state": state,
+        })
+        return f"{GITHUB_AUTHORIZE_URL}?{query}", state
+
+    def finish(self, code: object, state: object, redirect_uri: str, now: float) -> str:
+        """The GitHub login behind a callback, or raise ValueError with a reason."""
+        if read_signed(self.signing_key, state, STATE_MAX_AGE_S, now) is None:
+            raise ValueError("the sign-in link expired or did not come from this site")
+        if not isinstance(code, str) or not code.isascii() or not code.strip():
+            raise ValueError("GitHub did not return an authorisation code")
+        login = self._exchange(code.strip(), redirect_uri)
+        if not isinstance(login, str) or not LOGIN_PATTERN.match(login):
+            raise ValueError("GitHub returned no usable login")
+        if not self.permits(login):
+            raise ValueError(f"{login} is not on this site's allowlist")
+        return login
+
+    def session(self, login: str, now: float) -> str:
+        return mint(self.signing_key, login, now)
+
+    def viewer(self, cookie: object, now: float) -> str | None:
+        login = read_signed(self.signing_key, cookie, SESSION_MAX_AGE_S, now)
+        return login if login and LOGIN_PATTERN.match(login) and self.permits(login) else None
+
+    # The real round trip. Injectable, so every test above runs without network.
+    def _github_exchange(self, code: str, redirect_uri: str) -> str:  # pragma: no cover
+        import urllib.request
+
+        body = urllib.parse.urlencode({
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }).encode()
+        request = urllib.request.Request(
+            GITHUB_TOKEN_URL, data=body,
+            headers={"Accept": "application/json", "User-Agent": APP_NAME},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        access = payload.get("access_token")
+        if not access:
+            raise ValueError(f"GitHub refused the code: {payload.get('error', 'no access_token')}")
+        request = urllib.request.Request(
+            GITHUB_USER_URL,
+            headers={"Accept": "application/vnd.github+json",
+                     "Authorization": f"Bearer {access}", "User-Agent": APP_NAME},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return str(json.loads(response.read().decode("utf-8")).get("login") or "")
 
 
 def run_with_deadline(command: list[str], deadline_s: float, cwd: str | None = None) -> tuple[int | None, str, bool]:
@@ -738,6 +892,16 @@ def modal_canceller(call_id: str) -> None:
 def modal_site() -> Site:
     blobs = modal.Dict.from_name(BLOBS_NAME, create_if_missing=True)
     return Site(records, blobs, VolumeLog(ledger_volume), modal_spawner, modal_settler, modal_canceller)
+
+
+def modal_identity(site: Site) -> Identity:
+    """GitHub sign-in if the OAuth secret is attached, a disabled stand-in if not."""
+    client_id = os.environ.get("GITHUB_CLIENT_ID", "")
+    client_secret = os.environ.get("GITHUB_CLIENT_SECRET", "")
+    if not (client_id and client_secret):
+        return Identity()
+    return Identity(client_id, client_secret, site.session_key(),
+                    os.environ.get("GITHUB_ALLOWED_LOGINS", ""))
 
 
 # ------------------------------------------------------------------ html
@@ -870,6 +1034,11 @@ def queue_positions(items: list[dict]) -> dict:
     return {sid: index for index, sid in enumerate(queue)}
 
 
+def github_cell(record: dict) -> str:
+    login = record.get("github")
+    return f"<br><small>@{esc(login)}</small>" if isinstance(login, str) and login else ""
+
+
 def submissions_table(items: list[dict], base: str) -> str:
     if not items:
         return "<p class='muted'>No submissions yet.</p>"
@@ -881,7 +1050,8 @@ def submissions_table(items: list[dict], base: str) -> str:
         cost = money(record.get("charged_usd")) if final else money(record.get("reserved_usd"))
         rows.append(
             f"<tr><td><a href='{base}/s/{esc(record['id'])}'>{esc(record['id'])}</a></td>"
-            f"<td>{esc(str(record.get('created_at', ''))[:16].replace('T', ' '))}</td><td>{esc(record.get('name'))}</td>"
+            f"<td>{esc(str(record.get('created_at', ''))[:16].replace('T', ' '))}</td>"
+            f"<td>{esc(record.get('name'))}{github_cell(record)}</td>"
             f"<td>{esc(str(record.get('band', '')).replace('mnist-medium-', ''))}</td><td>{esc(record.get('mode'))}</td>"
             f"<td>{status_cell(record, positions.get(record['id']))}</td>"
             f"<td class='num'>{fmt(summary.get('mean_ms'))}</td>"
@@ -896,8 +1066,22 @@ def submissions_table(items: list[dict], base: str) -> str:
     )
 
 
+def sign_in_block(base: str, signed_in: str | None, required: bool) -> str:
+    """Who you are, or how to become someone. Empty when sign-in is off."""
+    if not required:
+        return ""
+    if signed_in:
+        return (f"<div class='budget'>Signed in as <b>{esc(signed_in)}</b>. "
+                f"<a href='{base}/logout'>Sign out</a>. Runs you start are recorded "
+                "against this account.</div>")
+    return (f"<div class='warn'><b>Sign in to submit.</b> This site spends a shared A100 "
+            f"budget, so a run has to be attributable. <a href='{base}/login'>Sign in with "
+            "GitHub</a> — the only thing read is your login name.</div>")
+
+
 def index_html(site: Site, base: str, template: str, error: str | None = None, prefill: dict | None = None,
-               items: list[dict] | None = None) -> str:
+               items: list[dict] | None = None, signed_in: str | None = None,
+               sign_in_required: bool = False) -> str:
     prefill = prefill or {}
     if items is None:
         items = site.settle()
@@ -922,6 +1106,7 @@ is timed with CUDA events over fresh secret draws; the accuracy on those same dr
 Rules and the interface are in the template below and in the
 <a href="https://github.com/cybertronai/sutro-problems/tree/main/mnist">MNIST problem page</a>.</p>
 {budget_block(book)}
+{sign_in_block(base, signed_in, sign_in_required)}
 {board_warning(items)}
 {error_block}
 <form method="post" action="{base}/submit" enctype="multipart/form-data">
@@ -1019,12 +1204,25 @@ def detail_html(record: dict, base: str, position: int | None, source: str | Non
 # ------------------------------------------------------------------ fastapi
 
 
-def build_api(site: Site, template: str):
+def build_api(site: Site, template: str, identity: Identity | None = None):
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
     from starlette.concurrency import run_in_threadpool
 
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    identity = identity or Identity()
+
+    def viewer(request) -> str | None:
+        """The signed-in GitHub login, or None. Always None when sign-in is off."""
+        if not identity.enabled:
+            return None
+        return identity.viewer(request.cookies.get(SESSION_COOKIE), time.time())
+
+    def callback_uri(request) -> str:
+        # Token-free on purpose: the secret link must not travel to GitHub or
+        # sit in its logs. The browser comes back here and is sent on to the
+        # one link this site serves.
+        return str(request.base_url).rstrip("/") + "/auth/callback"
 
     def check(token: str) -> str:
         if not token.isascii() or not secrets.compare_digest(token, site.token()):
@@ -1039,13 +1237,56 @@ def build_api(site: Site, template: str):
         return PlainTextResponse("nothing here", status_code=404)
 
     @api.get("/{token}", response_class=HTMLResponse)
-    def index(token: str):
+    def index(token: str, request: Request):
         base = check(token)
-        return HTMLResponse(index_html(site, base, template))
+        return HTMLResponse(index_html(site, base, template, signed_in=viewer(request),
+                                       sign_in_required=identity.enabled))
+
+    @api.get("/{token}/login")
+    def login(token: str, request: Request):
+        base = check(token)
+        if not identity.enabled:
+            return RedirectResponse(base, status_code=303)
+        url, _ = identity.start(callback_uri(request), time.time())
+        return RedirectResponse(url, status_code=303)
+
+    @api.get("/{token}/logout")
+    def logout(token: str):
+        base = check(token)
+        response = RedirectResponse(base, status_code=303)
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        return response
+
+    @api.get("/auth/callback", response_class=HTMLResponse)
+    async def auth_callback(request: Request):
+        """Token-free by design; a cookie here is worthless without the link."""
+        if not identity.enabled:
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            login_name = await run_in_threadpool(
+                identity.finish, request.query_params.get("code"),
+                request.query_params.get("state"), callback_uri(request), time.time())
+        except ValueError as error:
+            return HTMLResponse(page("Sign-in failed",
+                                     f"<h1>Sign-in failed</h1><div class='err'>{esc(str(error))}</div>"),
+                                status_code=400)
+        base = "/" + await run_in_threadpool(site.token)
+        response = RedirectResponse(base, status_code=303)
+        response.set_cookie(
+            SESSION_COOKIE, identity.session(login_name, time.time()),
+            max_age=SESSION_MAX_AGE_S, httponly=True, samesite="lax",
+            secure=request.url.scheme == "https", path="/")
+        return response
 
     @api.post("/{token}/submit")
     async def submit(token: str, request: Request):
         base = await run_in_threadpool(check, token)  # check() reads the Dict: keep it off the event loop
+        who = await run_in_threadpool(viewer, request)
+        if identity.enabled and not who:
+            return HTMLResponse(await run_in_threadpool(
+                index_html, site, base, template,
+                "sign in with GitHub before spending the shared budget", None, None,
+                None, True), status_code=403)
         try:
             declared = int(request.headers.get("content-length") or 0)
         except ValueError:
@@ -1076,7 +1317,7 @@ def build_api(site: Site, template: str):
                     index_html, site, base, template, "the uploaded file is not UTF-8 text", prefill),
                     status_code=400)
         source = source.replace("\r\n", "\n")
-        record, rejection = await run_in_threadpool(site.submit, name, band, mode, source)
+        record, rejection = await run_in_threadpool(site.submit, name, band, mode, source, who)
         if rejection:
             return HTMLResponse(await run_in_threadpool(
                 index_html, site, base, template, rejection,
@@ -1121,13 +1362,14 @@ def build_api(site: Site, template: str):
 
 
 @app.function(image=web_image, max_containers=1, scaledown_window=300, min_containers=0,
-              volumes={LEDGER_MOUNT: ledger_volume},
+              volumes={LEDGER_MOUNT: ledger_volume}, secrets=GITHUB_SECRETS,
               env={"SUTRO_BUDGET_USD": str(DEFAULT_BUDGET_USD)})
 @modal.concurrent(max_inputs=20)
 @modal.asgi_app()
 def web():
     template = (Path(REMOTE_HARNESS) / "submission.py").read_text()
-    return build_api(modal_site(), template)
+    site = modal_site()
+    return build_api(site, template, modal_identity(site))
 
 
 @app.function(image=web_image, schedule=modal.Period(minutes=10),

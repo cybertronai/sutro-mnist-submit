@@ -102,6 +102,48 @@ uv run --python 3.11 --with "torch==2.2.2" --with "numpy<2" --with pyyaml \
 | Queue cap | `MAX_INFLIGHT` | `8` | submissions queued at once |
 | Kernel size cap | `MAX_SOURCE_BYTES` | 256 KB | the evaluator enforces its own, smaller cap (20,480 bytes) inside the run |
 | Egress | `SUTRO_ALLOW_NETWORK=1` at deploy | denied | leave denied; the datasets are baked into the image |
+| GitHub sign-in | `SUTRO_GITHUB_OAUTH=1` at deploy, plus the secret below | off | off means the link is the only gate, exactly as before. See 4a. |
+
+### 4a. GitHub sign-in (optional)
+
+Off by default. The link alone is a fine gate while it is shared by hand, but
+it cannot say *who* spent the budget: anyone holding it can burn the whole cap
+anonymously, and a leaked link can only be rotated, never attributed. Turning
+sign-in on makes every run carry a GitHub login.
+
+1. Create an OAuth app at <https://github.com/settings/developers>.
+   **Homepage URL** is the site's URL; **Authorization callback URL** is that
+   URL plus `/auth/callback` — no token in it. You need the site's URL first,
+   so deploy once without sign-in, run `uvx modal run web/app.py::link`, and
+   take the origin from that.
+2. Store the credentials:
+
+   ```bash
+   uvx modal secret create sutro-mnist-github-oauth \
+       GITHUB_CLIENT_ID=Iv1.xxxxxxxx GITHUB_CLIENT_SECRET=xxxxxxxx
+   ```
+
+   Add `GITHUB_ALLOWED_LOGINS=alice,bob` to that secret to restrict the site to
+   named accounts; leave it out and any GitHub account may submit.
+3. Redeploy with the flag:
+
+   ```bash
+   SUTRO_GITHUB_OAUTH=1 uvx modal deploy web/app.py
+   ```
+
+   The flag is what attaches the secret. Without it the secret is not
+   referenced at all, so a workspace that never created one still deploys.
+4. Check it: open the link in a private window. You should see "Sign in to
+   submit", and the submit button should return 403 until you have signed in.
+   After signing in the index says "Signed in as <you>" and new rows carry
+   `@<login>`.
+
+Only the login name is read (`read:user`). The session cookie is HMAC-signed
+with a key stored in the records Dict, is `HttpOnly`/`SameSite=Lax`/`Secure`,
+and lasts 7 days. Rotating the link with `::rotate` does **not** sign people
+out; the two are independent on purpose.
+
+To turn it off again, redeploy without `SUTRO_GITHUB_OAUTH=1`.
 
 ## 5. Deploy
 

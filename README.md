@@ -101,9 +101,12 @@ Fixed costs: 30 s pool load, 120 s child start-up, 120 s warm-up, 30 s reserve; 
   canonical copy of this repository is `cybertronai/sutro-mnist-submit`.
 - A 64-agent adversarial review of the first version found 19 defects; all
   are fixed and covered by tests. They are catalogued in [LESSONS.md](LESSONS.md).
-- Access is deliberately "security through obscurity": the random token in
-  the URL is the only gate. GitHub login is a planned follow-up; the hook for
-  it is the `check()` function in `web/app.py`.
+- Access is the random token in the URL. Optional GitHub sign-in now sits on
+  top of it: off by default, and when enabled every run carries the
+  submitter's login, so spend is attributable rather than anonymous. See
+  [DEPLOY.md](DEPLOY.md) section 4a. It has been exercised end to end against
+  a fake provider in `tests/test_web.py` (13 tests); the one step that needs a
+  real GitHub OAuth app is creating it, which needs the deployed URL.
 
 ## Origin
 

@@ -12,10 +12,20 @@ the shape of the data. `<link>` is `https://<workspace>--sutro-mnist-submit-web.
 | POST | `/<token>/submit` | handles the form | on success 303 → the new submission's page; on rejection re-renders the index with the reason and the typed kernel (400); 413 if the body is over 320 KB |
 | GET | `/<token>/s/<id>` | **Submission detail**: status, result table, per-step table, raw evaluator output per step, stderr (collapsed), the kernel | refreshes itself every 15 s while the run is queued or running |
 | GET | `/<token>/s/<id>/source` | the kernel as plain text | |
+| GET | `/<token>/login` | redirects to GitHub's consent screen | 303 straight back to the index when sign-in is off |
+| GET | `/<token>/logout` | clears the session cookie, 303 to the index | |
+| GET | `/auth/callback` | finishes the GitHub round trip, sets the cookie, 303 to the index | **not** behind the token, on purpose: see below. 404 when sign-in is off |
 
 Any path whose first segment is not the token (including non-ASCII ones)
 returns 404; a known path with the wrong method returns 405. The token is
 compared in constant time.
+
+`/auth/callback` is the one route outside the token. That is deliberate: the
+`redirect_uri` sent to GitHub is logged by GitHub, so putting the secret link
+in it would hand the link over. The callback carries no token, and what it
+grants -- a session cookie -- is worthless to anyone who does not already have
+the link. The OAuth `state` is HMAC-signed with a server-side key and expires
+after 10 minutes, so the callback only accepts a round trip this site started.
 
 ### The form (`POST /<token>/submit`, multipart)
 
