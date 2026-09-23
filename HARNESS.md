@@ -1,5 +1,5 @@
 > **Note for this repository.** This is the evaluator's own README, copied from
-> `cybertronai/sutro-problems/gpumode` at harness version 1.1.1 (2026-09-23). The
+> `cybertronai/sutro-problems/gpumode` at harness version 1.1.2 (2026-09-23). The
 > `redteam/` directory it refers to stays in that repository and is not included
 > here; everything else it lists is present. For deploying the hosted submission
 > site, start at [README.md](README.md) and [DEPLOY.md](DEPLOY.md).

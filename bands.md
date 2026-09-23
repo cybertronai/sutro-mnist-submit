@@ -7,3 +7,19 @@
 | `mnist-medium-5pct` | 5% | 104,500 / 110,000 | 11 |
 | `mnist-medium-8pct` | 8% | 101,200 / 110,000 | 11 |
 | `mnist-medium-12pct` | 12% | 96,800 / 110,000 | 11 |
+
+## Mode time budgets
+
+The per-call limit is `max_call_ms`. A mode's timeout has to cover the
+pool load, the child's start-up, the untimed warm-up call, every timed
+call at that limit, and the reserve the evaluator keeps so it can report
+a failure itself. `make_bands.py` refuses to generate a band where it
+does not, because then the published per-call limit is not the real one.
+
+| Mode | Timed calls | Needs | Timeout | Headroom |
+| --- | ---: | ---: | ---: | ---: |
+| `test` | 1 | 360 s | 420 s | 60 s |
+| `benchmark` | 3 | 480 s | 600 s | 120 s |
+| `leaderboard` | 13 | 1080 s | 1200 s | 120 s |
+
+Fixed costs: 30 s pool load, 120 s child start-up, 120 s warm-up, 30 s reserve; 60 s per timed call.

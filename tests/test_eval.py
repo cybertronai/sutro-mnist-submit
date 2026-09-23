@@ -534,3 +534,92 @@ def test_make_bands_check_notices_a_stale_readme(tmp_path):
     rendered = make_bands.render(config)
     assert "README.md" in rendered
     assert make_bands.README_END in rendered["README.md"]
+
+
+# ------------------------------------------------------------------ timeout floor
+
+def test_make_bands_mirrors_the_evaluators_own_timeout_constants():
+    # make_bands.py is stdlib-only and cannot import eval.py, so it keeps its
+    # own copies. If either side moves, the generated budgets go wrong quietly.
+    assert make_bands.MODE_RESERVE_S == harness.MODE_RESERVE_S
+    import inspect
+
+    startup = inspect.signature(harness.Child.__init__).parameters["startup_timeout_s"]
+    assert make_bands.CHILD_STARTUP_S == startup.default
+
+
+def test_timeout_floor_counts_every_bounded_call_of_the_mode():
+    settings = {
+        "draws": 11,
+        "bench_draws": 3,
+        "holdout": 1,
+        "holdout_draws": 2,
+        "max_call_ms": 60000,
+        "warmup_max_call_ms": 120000,
+    }
+    assert make_bands.timed_calls(settings, "test") == 1
+    assert make_bands.timed_calls(settings, "benchmark") == 3
+    # the hold-out calls are timed and ranked, so they are part of the budget
+    assert make_bands.timed_calls(settings, "leaderboard") == 13
+
+    fixed = (
+        make_bands.POOL_LOAD_S
+        + make_bands.CHILD_STARTUP_S
+        + 120
+        + make_bands.MODE_RESERVE_S
+    )
+    assert make_bands.timeout_floor(settings, "leaderboard") == fixed + 13 * 60
+    assert make_bands.timeout_floor(settings, "test") == fixed + 60
+
+
+def test_a_hold_out_free_band_does_not_reserve_hold_out_calls():
+    settings = {
+        "draws": 11,
+        "bench_draws": 3,
+        "holdout": 0,
+        "holdout_draws": 2,
+        "max_call_ms": 60000,
+        "warmup_max_call_ms": 120000,
+    }
+    assert make_bands.timed_calls(settings, "leaderboard") == 11
+
+
+def test_every_shipped_band_can_afford_its_own_per_call_limit():
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    assert make_bands.check_timeouts(config) == []
+
+
+def test_check_timeouts_names_the_band_and_the_mode_that_cannot_pay():
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    config["defaults"]["max_call_ms"] = 120000  # double the per-call limit
+    problems = make_bands.check_timeouts(config)
+    # benchmark and leaderboard both become unaffordable, for every band
+    assert len(problems) == 2 * len(config["bands"])
+    assert any("ranked_timeout" in line for line in problems)
+    assert any("benchmark_timeout" in line for line in problems)
+    assert all(
+        any(band["name"] in line for line in problems) for band in config["bands"]
+    )
+
+
+def test_make_bands_refuses_to_generate_a_band_it_cannot_afford(tmp_path, monkeypatch, capsys):
+    # The guard has to stop the write path too, not just --check: otherwise a
+    # bad edit silently ships a task.yml whose max_call_ms is unenforceable.
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    config["defaults"]["test_timeout"] = 60
+    bad = tmp_path / "bands.json"
+    bad.write_text(json.dumps(config))
+    monkeypatch.setattr(make_bands, "HERE", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["make_bands.py"])
+    assert make_bands.main() == 1
+    assert "timeout floor" in capsys.readouterr().out
+    assert not (tmp_path / "sutro.yaml").exists()
+
+
+def test_bands_md_publishes_the_mode_budget_table():
+    text = (HERE.parent / "bands.md").read_text()
+    assert "## Mode time budgets" in text
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    settings = {**config["defaults"], **config["bands"][0]}
+    floor = make_bands.timeout_floor(settings, "leaderboard")
+    assert f"| {floor} s |" in text

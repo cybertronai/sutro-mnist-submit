@@ -43,7 +43,7 @@ scripts/smoke.py      submit a kernel to a deployed site and wait for the verdic
 tests/test_web.py     41 unit tests for the site (no Modal account, no GPU needed)
 tests/test_eval.py    the evaluator's own unit tests
 eval.py, utils.py, mnist_data.py, task.py, reference.py, submission.py
-                      the evaluator harness (version 1.1.1) and the kernel template
+                      the evaluator harness (version 1.1.2) and the kernel template
 run_modal.py          the harness's standalone runner; the site reuses its Modal image and evaluate()
 mnist-medium-*/       one task.yml per accuracy band (generated from bands.json by make_bands.py)
 submissions/          reference kernels: ncm_baseline, pca_qda, mlp512, cg_pair
@@ -74,6 +74,22 @@ check; see HARNESS.md).
 | `mnist-medium-5pct` | 5% | 104,500 / 110,000 | 11 |
 | `mnist-medium-8pct` | 8% | 101,200 / 110,000 | 11 |
 | `mnist-medium-12pct` | 12% | 96,800 / 110,000 | 11 |
+
+## Mode time budgets
+
+The per-call limit is `max_call_ms`. A mode's timeout has to cover the
+pool load, the child's start-up, the untimed warm-up call, every timed
+call at that limit, and the reserve the evaluator keeps so it can report
+a failure itself. `make_bands.py` refuses to generate a band where it
+does not, because then the published per-call limit is not the real one.
+
+| Mode | Timed calls | Needs | Timeout | Headroom |
+| --- | ---: | ---: | ---: | ---: |
+| `test` | 1 | 360 s | 420 s | 60 s |
+| `benchmark` | 3 | 480 s | 600 s | 120 s |
+| `leaderboard` | 13 | 1080 s | 1200 s | 120 s |
+
+Fixed costs: 30 s pool load, 120 s child start-up, 120 s warm-up, 30 s reserve; 60 s per timed call.
 
 <!-- END GENERATED -->
 ## Status at snapshot time (2026-09-23)

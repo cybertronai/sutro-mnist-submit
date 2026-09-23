@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import random
 
-HARNESS_VERSION = "sutro-mnist-medium-time/1.1.1"
+HARNESS_VERSION = "sutro-mnist-medium-time/1.1.2"
 
 # A100 (40 GB and 80 GB) has a 40 MB L2. Writing 256 MB evicts it several times
 # over and costs under a millisecond at ~1.5 TB/s. KernelBot's AMD harness uses

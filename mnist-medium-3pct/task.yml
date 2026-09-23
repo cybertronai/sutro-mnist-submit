@@ -49,13 +49,13 @@ config:
 templates:
   Python: "submission.py"
 
-test_timeout: 300
+test_timeout: 420
 benchmark_timeout: 600
 ranked_timeout: 1200
 ranking_by: "last"
 
 tests:
-  - {"size": 9, "train": 10000, "test": 10000, "error_bp": 300, "draw_slack_bp": 150, "dispersion_x10": 20, "max_call_ms": 60000, "warmup_max_call_ms": 120000, "max_source_bytes": 20480, "max_literal_bytes": 4096, "test_timeout": 300, "benchmark_timeout": 600, "ranked_timeout": 1200, "draws": 1, "bench_draws": 1, "seed": 101, "holdout": 0}
+  - {"size": 9, "train": 10000, "test": 10000, "error_bp": 300, "draw_slack_bp": 150, "dispersion_x10": 20, "max_call_ms": 60000, "warmup_max_call_ms": 120000, "max_source_bytes": 20480, "max_literal_bytes": 4096, "test_timeout": 420, "benchmark_timeout": 600, "ranked_timeout": 1200, "draws": 1, "bench_draws": 1, "seed": 101, "holdout": 0}
 
 benchmarks:
-  - {"size": 9, "train": 10000, "test": 10000, "error_bp": 300, "draw_slack_bp": 150, "dispersion_x10": 20, "max_call_ms": 60000, "warmup_max_call_ms": 120000, "max_source_bytes": 20480, "max_literal_bytes": 4096, "test_timeout": 300, "benchmark_timeout": 600, "ranked_timeout": 1200, "draws": 11, "bench_draws": 3, "seed": 202, "holdout": 1, "holdout_draws": 2, "holdout_min_bp": 3000}
+  - {"size": 9, "train": 10000, "test": 10000, "error_bp": 300, "draw_slack_bp": 150, "dispersion_x10": 20, "max_call_ms": 60000, "warmup_max_call_ms": 120000, "max_source_bytes": 20480, "max_literal_bytes": 4096, "test_timeout": 420, "benchmark_timeout": 600, "ranked_timeout": 1200, "draws": 11, "bench_draws": 3, "seed": 202, "holdout": 1, "holdout_draws": 2, "holdout_min_bp": 3000}

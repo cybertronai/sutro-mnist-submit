@@ -1,6 +1,8 @@
 # MNIST-medium time leaderboard: design report
 
-Harness `sutro-mnist-medium-time/1.1.1`, 2026-09-22. Reader: Yaroslav.
+Harness `sutro-mnist-medium-time/1.1.2`, 2026-09-23. Reader: Yaroslav.
+1.1.2 changes gates and budgets only; the timed path is byte-identical to
+1.1.1, so times measured under either version stay comparable.
 Section 10 lists the changes an independent audit of 1.1.0 produced; every
 number measured on hardware below was taken with 1.1.0 and is unaffected by
 them, except where section 10 says otherwise.
@@ -448,11 +450,20 @@ the only thing that closes `subprocess curl`.
    no hold-out, is a rehearsal surface for a memorizer. Consider whether
    `benchmark` should also run one hold-out call.
 7. **Deadline.** `bands.json` says `2026-12-31 23:59`, a placeholder.
-8. **Timeout headroom at the slow end.** `max_call_ms` is 60 s while
-   `ranked_timeout` is 1200 s, and `mlp512` at 26.5 s/call already uses 382 s of
-   it. An entry 3x slower times out before the per-call limit ever fires. Either
-   lower `max_call_ms` to about 40 s or raise `ranked_timeout`, before opening a
-   band to slow entries.
+8. **Timeout headroom at the slow end.** *Settled in 1.1.2.* `make_bands.py`
+   now derives a floor for every mode -- pool load, child start-up, the untimed
+   warm-up, every timed call at `max_call_ms`, and `MODE_RESERVE_S` -- and
+   refuses to generate a band whose timeout is below it, so a published
+   `max_call_ms` is always the limit that actually binds. The floor caught a
+   live violation: `test_timeout` was 300 s against a 360 s floor, i.e. an entry
+   using its full warm-up plus one full-length call could not finish the
+   *cheapest* mode, the one every submitter runs first. `test_timeout` is now
+   420 s. Raising it pushed the leaderboard path (test + benchmark + ranked)
+   into `deadline_seconds`'s clamp on Modal's container timeout, which would
+   have moved the same failure one layer up, so `GPU_TIMEOUT_S` went 2400 -> 3000
+   and a test now asserts the clamp never binds for any band or mode. Pool load
+   was measured at 0.93 s for both datasets at size 9, so the 30 s allowance is
+   ~30x margin. Leaderboard headroom is now 120 s; benchmark 150 s; test 60 s.
 
 ## 7. Findings and surprises from the GPU runs
 

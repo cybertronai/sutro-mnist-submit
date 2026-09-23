@@ -144,7 +144,7 @@ The script is standard-library only (flags: `--kernel`, `--band`, `--mode`,
 `--name`, `--timeout`, `--expect`; exit code 0 on the expected verdict). It posts `submissions/ncm_baseline.py` in test mode on the 12% band
 and polls until the verdict. Expected output ends with `"status": "passed"`,
 `"accuracy_pct"` near 80, `"mean_ms"` under a few ms, `"harness":
-"sutro-mnist-medium-time/1.1.1"` (or newer), and `"charged_usd"` between
+"sutro-mnist-medium-time/1.1.2"` (or newer), and `"charged_usd"` between
 0.05 and 0.10. The first run after a deploy includes a cold container start
 and can take 60–90 seconds longer than later ones.
 

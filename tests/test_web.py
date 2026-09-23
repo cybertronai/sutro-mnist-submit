@@ -121,10 +121,19 @@ def test_validation_accepts_aliased_kernels():
 
 def test_reservations_follow_the_task_timeouts_and_the_worker_deadline():
     task = load_task("mnist-medium-5pct")
-    assert task["test_timeout"] == 300 and task["benchmark_timeout"] == 600 and task["ranked_timeout"] == 1200
-    assert deadline_seconds(task, "test") == 300 + site_app.POOL_PAD_S
-    assert deadline_seconds(task, "benchmark") == 600 + site_app.POOL_PAD_S
-    assert deadline_seconds(task, "leaderboard") == 2100 + site_app.POOL_PAD_S
+    # The timeouts themselves live in bands.json; read them rather than repeat
+    # them, so raising one is a one-line edit there and not a test failure here.
+    bands = json.loads((Path(site_app.__file__).resolve().parent.parent / "bands.json").read_text())
+    defaults = bands["defaults"]
+    assert task["test_timeout"] == defaults["test_timeout"]
+    assert task["benchmark_timeout"] == defaults["benchmark_timeout"]
+    assert task["ranked_timeout"] == defaults["ranked_timeout"]
+    assert deadline_seconds(task, "test") == task["test_timeout"] + site_app.POOL_PAD_S
+    assert deadline_seconds(task, "benchmark") == task["benchmark_timeout"] + site_app.POOL_PAD_S
+    assert deadline_seconds(task, "leaderboard") == (
+        task["test_timeout"] + task["benchmark_timeout"] + task["ranked_timeout"]
+        + site_app.POOL_PAD_S
+    )
     # the deadline the worker enforces always fits under Modal's own container timeout
     for mode in site_app.MODES:
         assert deadline_seconds(task, mode) + site_app.STARTUP_PAD_S <= site_app.GPU_TIMEOUT_S
@@ -649,3 +658,25 @@ def test_rejection_shows_the_reason_and_keeps_the_kernel(client, site):
     assert "Not submitted" in response.text and "custom_kernel" in response.text
     assert "def nothing" in response.text
     assert site.submissions() == []
+
+
+def test_the_container_backstop_never_truncates_the_evaluator():
+    """deadline_seconds() clamps to Modal's container timeout. That clamp must
+    never bind: if it does, the worker kills a run that is still inside the
+    per-step budgets its own task.yml publishes, and the submitter sees a bare
+    timeout instead of a verdict."""
+    root = Path(site_app.__file__).resolve().parent.parent
+    for band in json.loads((root / "bands.json").read_text())["bands"]:
+        task = load_task(band["name"])
+        for mode in site_app.MODES:
+            uncapped = sum(
+                {"test": task["test_timeout"],
+                 "benchmark": task["benchmark_timeout"],
+                 "leaderboard": task["ranked_timeout"]}[step]
+                for step in site_app.STEP_SEQUENCE[mode]
+            ) + site_app.POOL_PAD_S
+            assert deadline_seconds(task, mode) == uncapped, (
+                f"{band['name']}/{mode}: the container backstop is truncating "
+                f"{uncapped:.0f} s of step budget to {deadline_seconds(task, mode):.0f} s"
+            )
+            assert worst_case_seconds(task, mode) <= site_app.GPU_TIMEOUT_S

@@ -86,7 +86,12 @@ OVERHEAD = 1.20
 RATE_USD_PER_S = A100_USD_PER_S * OVERHEAD
 STARTUP_PAD_S = 60.0  # image pull, container boot and teardown around the deadline
 POOL_PAD_S = 180.0  # dataset download and box-area resize inside eval.py
-GPU_TIMEOUT_S = 2400  # Modal's backstop on the container; the worker's own deadline is shorter
+GPU_TIMEOUT_S = 3000  # Modal's backstop on the container; the worker's own deadline is shorter.
+# It has to stay above sum(step timeouts) + POOL_PAD_S + STARTUP_PAD_S, or the
+# min() in deadline_seconds() starts binding and the worker kills a legitimate
+# run before the evaluator has spent the budget its own task.yml promises.
+# tests/test_web.py::test_the_container_backstop_never_truncates_the_evaluator
+# holds that line for every band and mode.
 DEFAULT_BUDGET_USD = float(os.environ.get("SUTRO_BUDGET_USD", "50"))
 MAX_INFLIGHT = 8
 MAX_SOURCE_BYTES = 256 * 1024
