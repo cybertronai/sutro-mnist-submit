@@ -104,6 +104,16 @@ LABEL_SALT = 0x5EED
 UNIVERSE_SALT = 0x5711
 DRAW_SALT = 0xD4A7
 
+# Every step of one submission is handed the same POPCORN_SEED, and the
+# benchmark and leaderboard steps are given the same case line, so without a
+# per-mode salt the cheap step is a free preview of the expensive one: the same
+# ranked draws and the same hold-out draw, in the same container, where a
+# submission can cache what it learned between steps. Salting the secret with
+# the mode makes each step's draws its own. Verified: at a fixed secret seed
+# the benchmark and leaderboard steps used to score [1603, 1564, 1586] on the
+# same three draws and see the same hold-out.
+MODE_SALT = {"test": 0x7E57, "benchmark": 0xBE7C, "leaderboard": 0x1EAD, "profile": 0x9401}
+
 # Calibration of the inter-process overhead: round trips measured before the
 # submission is imported, so nothing it does can inflate the number.
 CALIBRATION_ROUNDS = 5
@@ -1287,6 +1297,7 @@ def main():
     else:
         secret = int.from_bytes(os.urandom(8), "big")
         seed_source = "random"
+    secret = combine(secret, MODE_SALT.get(mode, 0))
     try:
         cases = read_cases(sys.argv[2], secret)
     except Exception as error:

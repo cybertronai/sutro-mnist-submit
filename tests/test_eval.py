@@ -440,7 +440,10 @@ def test_a_ranked_run_without_popcorn_seed_still_draws_a_secret_seed(tmp_path):
 def test_a_supplied_popcorn_seed_is_used_and_reported(tmp_path):
     result = run_main_and_capture(tmp_path, CASE_LINE, secret="20260922")
     assert "system.seed_source: popcorn" in result["lines"]
-    assert result["seed"] == combine(202, 20260922)
+    # the probe runs mode "test", and main() salts the secret with the mode so
+    # the cheap steps cannot preview the ranked one
+    assert result["seed"] == combine(202, combine(20260922, harness.MODE_SALT["test"]))
+    assert result["seed"] != combine(202, 20260922)
 
 
 # ------------------------------------------------------------------ module-level inertness
@@ -715,3 +718,38 @@ def test_make_bands_refuses_a_malformed_deadline(tmp_path, monkeypatch, capsys):
     assert make_bands.main() == 1
     assert "deadline" in capsys.readouterr().out
     assert not (tmp_path / "sutro.yaml").exists()
+
+
+# ------------------------------------------------------------------ per-mode draws
+
+def test_every_mode_the_evaluator_accepts_has_its_own_salt():
+    # main() dispatches on exactly these; a mode with no salt would silently
+    # fall back to 0 and share its draws with any other unsalted mode.
+    assert set(harness.MODE_SALT) == {"test", "benchmark", "leaderboard", "profile"}
+    assert len(set(harness.MODE_SALT.values())) == len(harness.MODE_SALT)
+
+
+def test_the_cheap_step_is_not_a_preview_of_the_ranked_one(tmp_path):
+    """Every step of one submission gets the same POPCORN_SEED, and benchmark
+    and leaderboard are handed the same case line. Before the mode salt they
+    drew the same data: at secret 4242 both scored [1603, 1564, 1586] on the
+    same three draws and saw the same hold-out draw. In the same container,
+    with /tmp surviving between steps, that is a replay surface."""
+    case = tmp_path / "cases.txt"
+    case.write_text("size: 9; train: 100; test: 100; seed: 202; draws: 3\n")
+
+    seeds = {}
+    for mode, salt in harness.MODE_SALT.items():
+        cases = harness.read_cases(case, combine(4242, salt))
+        seeds[mode] = cases[0]["seed"]
+    assert len(set(seeds.values())) == len(seeds), seeds
+
+    # and the salt is what does it: without one every mode lands on one seed
+    same = {mode: harness.read_cases(case, 4242)[0]["seed"] for mode in harness.MODE_SALT}
+    assert len(set(same.values())) == 1
+
+
+def test_the_public_case_seed_still_reaches_the_combined_seed():
+    # the mode salt must compose with the secret, not replace it
+    assert combine(4242, harness.MODE_SALT["benchmark"]) != 4242
+    assert combine(4242, harness.MODE_SALT["benchmark"]) != harness.MODE_SALT["benchmark"]

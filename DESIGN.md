@@ -872,6 +872,39 @@ and now say "not run"; `tests/test_web.py` skips without `fastapi`; and
 
 ## 11. Changes in 1.1.2
 
+### A replay surface between steps, found while reviewing the hold-out change
+
+A leaderboard submission runs three steps -- test, then benchmark, then
+leaderboard -- and `run_modal.run_one` hands every one of them the same
+`POPCORN_SEED`. benchmark and leaderboard are also handed the same case line.
+So their combined seed was identical, and so were their draws. Measured at
+secret 4242, before the fix:
+
+| Step | Ranked draws (correct of 2,000) | Hold-out |
+| --- | --- | --- |
+| benchmark | 1603, 1564, 1586 | 1299 |
+| leaderboard | 1603, 1564, 1586, 1614 | 1299, 1341 |
+
+The cheap step was a free preview of the expensive one, including the hold-out
+draw, and all three steps run in one container where a submission can leave
+something in `/tmp` between them. That is the replay hole D3 closed for the
+warm-up call, reopened one level up. Adding a hold-out call to benchmark
+(item 6) would have extended it to the learning check itself.
+
+`MODE_SALT` now salts the secret with the mode before the case seeds are
+combined, so every step draws its own data. After the fix, same secret:
+
+| Step | Ranked draws | Hold-out |
+| --- | --- | --- |
+| benchmark | 1590, 1593, 1517 | 1303 |
+| leaderboard | 1574, 1597, 1577, 1601 | 1336, 1344 |
+
+This changes what a given `--seed` produces. Nothing in sections 1, 3 or 7 is
+a per-draw number, so the measured times and accuracies there still stand.
+
+### The rest
+
+
 Everything here changes a gate, a budget or the site. The timed path -- the
 staging round trip, the L2 flush, the CUDA events, the four clocks, the
 plausibility bounds -- is byte-identical to 1.1.1, so every number measured in
