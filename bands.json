@@ -1,0 +1,75 @@
+{
+  "comment": [
+    "Single source of truth for the accuracy bands. Edit this file and run",
+    "    python make_bands.py",
+    "to regenerate every mnist-medium-<band>/task.yml and sutro.yaml.",
+    "",
+    "error_bp is the maximum MEAN error in basis points over all draws of a",
+    "ranked run: the aggregate rule is",
+    "    sum(correct) >= ceil(draws * test * (10000 - error_bp) / 10000).",
+    "draw_slack_bp adds a per-draw floor on top of it, so a submission cannot",
+    "buy the mean by running a cheap learner on some of the draws.",
+    "A 15% entry band is { name: mnist-medium-15pct, error_bp: 1500 } and the",
+    "1.6% top band under discussion is { name: mnist-medium-1p6pct,",
+    "error_bp: 160 }; add either as one more object in bands[] and rerun.",
+    "",
+    "holdout_draws Fashion-MNIST calls are interleaved with the ranked ones at",
+    "secret positions; they are timed and ranked like any other call and must",
+    "clear holdout_min_bp in aggregate. 3000 bp (70%) is calibrated from CPU dry",
+    "runs only (pca_qda 78.9%, nearest class mean 66.5%) and must be re-measured",
+    "on an A100 before a band opens.",
+    "",
+    "Anything else a band may vary lives in defaults/ below and can be",
+    "overridden per band with the same keys."
+  ],
+  "deadline": "2026-12-31 23:59",
+  "gpu": "A100",
+  "defaults": {
+    "size": 9,
+    "train": 10000,
+    "test": 10000,
+    "draws": 11,
+    "bench_draws": 3,
+    "holdout": 1,
+    "holdout_min_bp": 3000,
+    "max_call_ms": 60000,
+    "test_seed": 101,
+    "benchmark_seed": 202,
+    "test_timeout": 300,
+    "benchmark_timeout": 600,
+    "ranked_timeout": 1200,
+    "holdout_draws": 2,
+    "draw_slack_bp": 150,
+    "dispersion_x10": 20,
+    "max_source_bytes": 20480,
+    "max_literal_bytes": 4096,
+    "warmup_max_call_ms": 120000
+  },
+  "bands": [
+    {
+      "name": "mnist-medium-2pct",
+      "error_bp": 200,
+      "label": "2%"
+    },
+    {
+      "name": "mnist-medium-3pct",
+      "error_bp": 300,
+      "label": "3%"
+    },
+    {
+      "name": "mnist-medium-5pct",
+      "error_bp": 500,
+      "label": "5%"
+    },
+    {
+      "name": "mnist-medium-8pct",
+      "error_bp": 800,
+      "label": "8%"
+    },
+    {
+      "name": "mnist-medium-12pct",
+      "error_bp": 1200,
+      "label": "12%"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Site and harness unit tests (no Modal account, no GPU)
+        run: >
+          uv run --python 3.12 --with modal --with "fastapi[standard]" --with pytest
+          --with pyyaml --with numpy python -m pytest tests -q

@@ -1,0 +1,367 @@
+"""Unit tests for the parts of the harness that decide whether a run is fair.
+
+    python -m pytest tests/test_eval.py -q
+
+No GPU, no dataset download: every test here is arithmetic, parsing or
+bookkeeping.
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+
+import eval as harness  # noqa: E402
+import make_bands  # noqa: E402
+from utils import combine, required_correct, stats, timing_plausible  # noqa: E402
+
+
+# ------------------------------------------------------------------ accuracy rule
+
+def test_required_correct_matches_the_published_bands():
+    # 11 draws x 10,000 queries, the numbers printed in every task.yml
+    assert required_correct(110000, 200) == 107800
+    assert required_correct(110000, 300) == 106700
+    assert required_correct(110000, 500) == 104500
+    assert required_correct(110000, 800) == 101200
+    assert required_correct(110000, 1200) == 96800
+
+
+def test_required_correct_rounds_up_and_uses_integers():
+    # 3 * 0.6667 = 2.0001 correct: two is not enough
+    assert required_correct(3, 3333) == 3
+    # exact multiples must not be inflated by float error
+    assert required_correct(10000, 200) == 9800
+    assert required_correct(110000, 0) == 110000
+    assert required_correct(110000, 10000) == 0
+    for total in (1, 7, 9999, 110000):
+        for error_bp in (0, 1, 160, 200, 1500, 9999, 10000):
+            exact = -(-(total * (10000 - error_bp)) // 10000)
+            assert required_correct(total, error_bp) == exact
+            assert (exact - 1) * 10000 < total * (10000 - error_bp) <= exact * 10000
+
+
+def test_required_correct_rejects_nonsense_bands():
+    with pytest.raises(ValueError):
+        required_correct(100, -1)
+    with pytest.raises(ValueError):
+        required_correct(100, 10001)
+
+
+def test_aggregate_rule_is_over_all_draws_not_per_draw():
+    # one bad draw can be paid for by the others; that is the intent
+    per_draw = [9600, 9450, 9500]
+    assert sum(per_draw) >= required_correct(30000, 500)
+    assert min(per_draw) < required_correct(10000, 500)
+
+
+# ------------------------------------------------------------------ seeds
+
+def test_combine_is_kernelbots_cantor_pairing():
+    def reference(a, b):
+        return int(a + (a + b) * (a + b + 1) // 2)
+
+    for a in (0, 1, 101, 202, 65535):
+        for b in (0, 3, 20260922, 2**40 + 7):
+            assert combine(a, b) == reference(a, b)
+
+
+def test_combine_hides_the_public_seed_behind_a_large_secret():
+    secret = 2**40 + 12345
+    combined = {combine(public, secret) for public in (101, 202, 303)}
+    assert all(value > secret for value in combined)
+    assert len(combined) == 3  # distinct public seeds stay distinct
+
+
+# ------------------------------------------------------------------ draws
+
+def make_pool(count=60000, classes=10):
+    rng = np.random.default_rng(7)
+    images = rng.random((count, 1, 3, 3), dtype=np.float32)
+    labels = (np.arange(count) % classes).astype(np.int64)
+    return images, labels
+
+
+def universes_for(pool, seed=4242):
+    return harness.split_universes(len(pool[1]), seed, harness.UNIVERSE_SALT)
+
+
+def test_draw_is_disjoint_deterministic_and_pulled_from_the_pool():
+    pool = make_pool()
+    universes = universes_for(pool)
+    visible, truth = harness.make_draw(pool, 12345, 50, 40, universes)
+    again, truth_again = harness.make_draw(pool, 12345, 50, 40, universes)
+    assert visible[0].shape == (50, 1, 3, 3)
+    assert visible[1].shape == (50,)
+    assert visible[2].shape == (40, 1, 3, 3)
+    assert truth.shape == (40,)
+    assert np.array_equal(visible[0], again[0]) and np.array_equal(truth, truth_again)
+    # no test image is also a training image
+    train_rows = {row.tobytes() for row in visible[0]}
+    assert not any(row.tobytes() in train_rows for row in visible[2])
+
+
+def test_test_images_are_never_shown_with_a_label_in_any_draw():
+    """The hole that made a pool-memoization table pay: every draw used to
+    re-split the same 60,000 rows, so a test image of draw 7 had probably
+    already arrived, labelled, in the training half of draw 2."""
+    pool = make_pool(count=2000)
+    universes = universes_for(pool, seed=99)
+    seen_with_a_label = set()
+    queried = set()
+    for step in range(12):
+        visible, _ = harness.make_draw(pool, 99 + 13 * step, 300, 300, universes)
+        seen_with_a_label.update(row.tobytes() for row in visible[0])
+        queried.update(row.tobytes() for row in visible[2])
+    assert seen_with_a_label and queried
+    assert not (seen_with_a_label & queried)
+
+
+def test_universes_split_the_pool_in_half_and_depend_on_the_secret():
+    first = harness.split_universes(1000, 12345, harness.UNIVERSE_SALT)
+    same = harness.split_universes(1000, 12345, harness.UNIVERSE_SALT)
+    other = harness.split_universes(1000, 12346, harness.UNIVERSE_SALT)
+    assert len(first[0]) == len(first[1]) == 500
+    assert not set(first[0]) & set(first[1])
+    assert np.array_equal(first[0], same[0])  # deterministic within a run
+    assert not np.array_equal(first[0], other[0])  # a different secret, a different split
+
+
+def test_label_permutation_is_secret_consistent_and_per_draw():
+    images, labels = make_pool()
+    pool = (images, labels)
+    universes = universes_for(pool)
+    visible, truth = harness.make_draw(pool, 999, 200, 200, universes)
+    rows = np.random.default_rng([999, harness.DRAW_SALT])
+    train_rows = rows.choice(universes[0], 200, replace=False)
+    test_rows = rows.choice(universes[1], 200, replace=False)
+    # the same permutation maps the true labels of both halves
+    mapping = {}
+    for true_label, shown in zip(labels[train_rows], visible[1]):
+        mapping.setdefault(int(true_label), int(shown))
+        assert mapping[int(true_label)] == int(shown)
+    for true_label, shown in zip(labels[test_rows], truth):
+        assert mapping[int(true_label)] == int(shown)
+    assert sorted(mapping.values()) == list(range(10))  # a permutation, not a collapse
+    # a different draw uses a different mapping, so memorized labels go stale
+    other, _ = harness.make_draw(pool, 1000, 200, 200, universes)
+    assert not np.array_equal(visible[1][:50], other[1][:50])
+
+
+def test_draw_refuses_to_overflow_its_half_of_the_pool():
+    pool = make_pool(count=60000)
+    universes = universes_for(pool)
+    with pytest.raises(ValueError):
+        harness.make_draw(pool, 1, 40000, 30000, universes)
+
+
+# ------------------------------------------------------------------ submission source
+
+def write_submission(tmp_path, body):
+    path = tmp_path / "submission.py"
+    path.write_text(body)
+    return path
+
+
+def test_source_cap_rejects_an_embedded_dataset(tmp_path):
+    case = dict(harness.DEFAULTS)
+    path = write_submission(tmp_path, "TABLE = '" + "a" * 30000 + "'\n")
+    with pytest.raises(harness.Failure) as error:
+        harness.check_submission_source(case, path)
+    assert "over the" in str(error.value)
+
+
+def test_source_cap_rejects_one_oversized_literal(tmp_path):
+    case = dict(harness.DEFAULTS, max_source_bytes=1_000_000)
+    path = write_submission(tmp_path, "TABLE = '" + "a" * 30000 + "'\n")
+    with pytest.raises(harness.Failure) as error:
+        harness.check_submission_source(case, path)
+    assert "literal" in str(error.value)
+
+
+def test_source_cap_accepts_every_shipped_submission():
+    case = dict(harness.DEFAULTS)
+    for path in sorted((HERE.parent / "submissions").glob("*.py")):
+        harness.check_submission_source(case, path)
+    harness.check_submission_source(case, HERE.parent / "submission.py")
+
+
+# ------------------------------------------------------------------ timing gate
+
+def test_timing_gate_accepts_an_honest_call():
+    assert timing_plausible(3.30, 3.45, 9.10) is None
+    assert timing_plausible(0.21, 0.55, 4.00, 3.60) is None  # sub-millisecond call
+    assert timing_plausible(260.0, 261.2, 275.0, 1.5) is None
+
+
+def test_timing_gate_catches_a_patched_timer():
+    assert "less than half" in timing_plausible(0.0, 260.0, 280.0)
+    assert timing_plausible(1.0, 260.0, 280.0) is not None
+
+
+def test_timing_gate_bounds_the_device_clock_from_below_with_the_parents():
+    # Both of the child's clocks scaled by the same constant: every ratio test
+    # between them still passes, and only the parent's clock notices.
+    reason = timing_plausible(0.008, 0.010, 70.0, 0.7)
+    assert reason is not None and "the parent measured" in reason
+    # the same call reported honestly is fine
+    assert timing_plausible(68.8, 69.0, 70.0, 0.7) is None
+    # and the overhead really is subtracted: a short call behind a slow pipe
+    assert timing_plausible(3.0, 3.2, 40.0, 36.0) is None
+
+
+def test_timing_gate_catches_work_outside_the_timed_window():
+    # half the work moved to an unsynchronized side stream
+    assert timing_plausible(40.0, 200.0, 220.0) is not None
+
+
+def test_timing_gate_catches_a_device_time_longer_than_the_wall_clock():
+    assert "exceeds the child" in timing_plausible(12.0, 5.0, 30.0)
+
+
+def test_timing_gate_trusts_the_parent_clock_over_the_child():
+    # a child that under-reports its own wall clock is still bounded by the parent
+    assert timing_plausible(100.0, 100.0, 50.0) is not None
+    assert timing_plausible(float("nan"), 10.0, 20.0) is not None
+
+
+# ------------------------------------------------------------------ cases
+
+def write_cases(tmp_path, text):
+    path = tmp_path / "cases.txt"
+    path.write_text(text)
+    return path
+
+
+def test_read_cases_fills_defaults_and_combines_the_seed(tmp_path):
+    path = write_cases(tmp_path, "size: 9; train: 10000; test: 10000; error_bp: 500; seed: 202\n")
+    case = harness.read_cases(path, 20260922)[0]
+    assert case["seed"] == combine(202, 20260922)
+    assert case["draws"] == harness.DEFAULTS["draws"]
+    assert case["max_call_ms"] == harness.DEFAULTS["max_call_ms"]
+    assert case["spec"].startswith("size: 9")
+
+
+def test_read_cases_rejects_unknown_fields_and_junk(tmp_path):
+    with pytest.raises(ValueError):
+        harness.read_cases(write_cases(tmp_path, "size: 9; sneaky: 1\n"), None)
+    with pytest.raises(ValueError):
+        harness.read_cases(write_cases(tmp_path, "size: nine\n"), None)
+    with pytest.raises(ValueError):
+        harness.read_cases(write_cases(tmp_path, "\n\n"), None)
+
+
+# ------------------------------------------------------------------ statistics
+
+def test_stats_reports_nanoseconds_like_kernelbot():
+    values = [3.0e6, 3.2e6, 2.8e6, 3.1e6]
+    result = stats(values)
+    assert result["runs"] == 4
+    assert result["best"] == 2.8e6 and result["worst"] == 3.2e6
+    assert abs(result["mean"] - 3.025e6) < 1
+    assert abs(result["median"] - 3.05e6) < 1
+    assert result["err"] == pytest.approx(result["std"] / 2)
+
+
+# ------------------------------------------------------------------ generated files
+
+def test_generated_problem_folders_are_up_to_date():
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    for relative, contents in make_bands.render(config).items():
+        assert (HERE.parent / relative).read_text() == contents, f"{relative} is stale"
+
+
+def test_readme_shows_the_generated_band_table():
+    table = (HERE.parent / "bands.md").read_text().strip()
+    assert table in (HERE.parent / "README.md").read_text()
+
+
+def test_every_band_case_parses_and_keeps_its_threshold():
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    for band in config["bands"]:
+        task = (HERE.parent / band["name"] / "task.yml").read_text()
+        cases = [json.loads(line[4:]) for line in task.splitlines()
+                 if line.startswith("  - {") and "error_bp" in line]
+        assert len(cases) == 2  # one test case, one ranked case
+        for fields in cases:
+            assert fields["error_bp"] == band["error_bp"]
+            assert set(fields) <= set(harness.DEFAULTS)
+
+
+# ------------------------------------------------------------------ process isolation
+
+def run_script(tmp_path, body, environment=None):
+    """Run a small program in its own interpreter and return its stdout."""
+    import subprocess
+
+    script = tmp_path / "probe.py"
+    script.write_text(f"import sys\nsys.path.insert(0, {str(HERE.parent)!r})\n" + body)
+    env = dict(os.environ)
+    env.pop("POPCORN_SEED", None)
+    env.update(environment or {})
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_network_guard_survives_raw_sockets_and_a_reloaded_module(tmp_path):
+    # The monkeypatch alone missed both of these: socket.socket subclasses the
+    # C type _socket.socket, and reloading socket rebuilds clean functions.
+    output = run_script(
+        tmp_path,
+        """
+from utils import install_network_guard
+
+install_network_guard()
+results = []
+
+import _socket
+try:
+    raw = _socket.socket(); raw.settimeout(1); raw.connect(("127.0.0.1", 9))
+    results.append("raw:REACHED")
+except BaseException as error:
+    results.append("raw:" + type(error).__name__)
+
+import importlib, socket
+importlib.reload(socket)
+try:
+    socket.create_connection(("127.0.0.1", 9), timeout=1)
+    results.append("reload:REACHED")
+except BaseException as error:
+    results.append("reload:" + type(error).__name__)
+
+try:
+    open("/tmp/train-images-idx3-ubyte.gz", "rb")
+    results.append("dataset:REACHED")
+except BaseException as error:
+    results.append("dataset:" + type(error).__name__)
+
+print(";".join(results))
+""",
+    )
+    assert output == "raw:NetworkDisabled;reload:NetworkDisabled;dataset:DatasetFileDenied"
+
+
+def test_the_secret_seed_is_removed_from_the_process_environment(tmp_path):
+    # os.environ.pop does not rewrite /proc/<pid>/environ, so the evaluator
+    # re-execs itself with the secret handed over on a pipe instead.
+    output = run_script(
+        tmp_path,
+        """
+import os
+import eval as harness
+
+payload = harness.scrub_secret_environment()
+print("secret=%s in_environ=%s" % (payload.get("secret"), "POPCORN_SEED" in os.environ))
+""",
+        {"POPCORN_SEED": "20260922"},
+    )
+    assert output == "secret=20260922 in_environ=False"

@@ -1,0 +1,720 @@
+# MNIST-medium time leaderboard: design report
+
+Harness `sutro-mnist-medium-time/1.1.0`, 2026-09-22. Reader: Yaroslav.
+Source of every number below: `gpumode/results/gpu-*.json` (one A100 on Modal,
+25 sequential containers, 1923 s = 32.1 min of GPU wall time) and
+`gpumode/results/cpu-*.json` (CPU dry runs). Code: `gpumode/eval.py`,
+`gpumode/utils.py`, `gpumode/task.py`, `gpumode/run_modal.py`.
+
+## 1. Bottom line
+
+The harness works. It builds, runs, ranks, and rejects. Five red-team agents
+broke version 1.0.0 in five independent ways; 1.1.0 closes all five, and on real
+CUDA nothing escaped, including the one exploit class (side stream plus
+disabled-timing events) that no CPU run could test.
+
+One blocker was found and fixed on the first A100 run: the calibration probe
+skipped the CUDA preamble, so every submission faster than about 3 ms was
+disqualified as "timing implausible". See section 7.
+
+### Measured entries, leaderboard mode, secret seed 20260922
+
+| Submission | Band | Verdict | Mean ms | Std ms | Accuracy, 11 draws | Hold-out | Device | Result |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| `submissions/pca_qda.py` | 5% | pass | 4.548 | 0.0096 | 95.35% (104,885/110,000, needs 104,500) | 78.01% | A100-SXM4-40GB | `results/gpu-02-pca-qda-5pct-leaderboard.json` |
+| `submissions/cg_pair.py` | 3% | pass | 270.177 | 0.0993 | 97.93% (107,725/110,000, needs 106,700) | 88.23% | A100-SXM4-40GB | `results/gpu-03b-cg-pair-3pct-leaderboard.json` |
+| `submissions/cg_pair.py` | 2% | **fail**, accuracy gate | 269.980 | 0.195 | 97.837% (29,351/30,000, needs 29,400) | not reached | A100-SXM4-40GB | `results/gpu-03-cg-pair-2pct-leaderboard.json` |
+| `submissions/mlp512.py` | 5% | **fail**, hold-out | 26,533 | 439 | 96.42% (106,057/110,000, passes) | 47.79% (needs 70%) | A100-SXM4-40GB | `results/gpu-04-mlp512-5pct-leaderboard.json` |
+| `submissions/ncm_baseline.py` | 12% | **fail**, per-draw floor (control) | 1.09 (test mode) | n/a | 79.84% on the test draw | not reached | A100-SXM4-40GB | `results/gpu-05-ncm-12pct-leaderboard-control.json` |
+
+The two failures are informative, not broken. `cg_pair` genuinely misses 2%
+under this protocol; `mlp512` genuinely fails the learning check. Both are
+open decisions in section 6.
+
+### Repeatability, `pca_qda` on the 5% band, three secret seeds, three containers
+
+| Secret seed | Mean ms | Within-run std | Accuracy | Hold-out | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 20260922 | 4.5475 | 0.21% | 95.350% | 78.01% | `results/gpu-02-pca-qda-5pct-leaderboard.json` |
+| 20260923 | 4.5349 | 0.35% | 95.481% | 77.82% | `results/gpu-06a-pca-qda-5pct-seed20260923.json` |
+| 777 | 4.5043 | 0.23% | 95.677% | 77.40% | `results/gpu-06b-pca-qda-5pct-seed777.json` |
+
+Cross-container spread 0.043 ms = 0.95% of the mean. Within-run spread
+0.21 to 0.35%. Two entries whose times differ by more than about 1% can be
+ranked; below that they are a tie. **Except** across board variants: the same
+computation ran 4.311 ms on an A100-SXM4-80GB
+(`results/gpu-07-03-timer-patch-12pct.json`) against 4.504 to 4.547 ms on five
+separate 40 GB containers, i.e. 4.5% faster, roughly 20x the within-run spread.
+Modal's `gpu="A100"` is not one board. Section 6.
+
+### Red-team summary, on CUDA
+
+25 GPU runs, 12 of them adversarial. Nothing escaped. Two gates are strictly
+stronger on the GPU than the CPU dry run suggested (dispersion at 20.7x rather
+than 7.7x; `threshold-gaming.py` rejected outright rather than merely honest).
+Full table in section 3.
+
+## 2. Design choices
+
+Each entry: Decision / Why / Precedent / Rejected.
+
+### D1. The ranked value is mean CUDA-event time per complete training-and-prediction call
+
+**Decision.** `benchmark.i.mean` in nanoseconds over `draws` fresh secret draws
+(11 ranked, 3 in benchmark mode), plus `median`, `std`, `err`, `best`, `worst`,
+`durations`, `accuracy`, `correct`, `required`, `wall_mean` (parent clock),
+`child_wall_mean`, `stage_mean`, `ipc_calibration`, `stage_calibration`,
+`loop_wall`, `holdout_accuracy`. `ranking_by: last`, one benchmark case per
+band. Every timed call is also an accuracy draw: time and accuracy come from
+the same 11 calls.
+
+**Why.** The Sutro numbers before this harness were self-reported and off by
+45x and 59x in two cases, and energy and time were measured on draw 0 only
+while accuracy used 11 draws. Ranking on the same calls that are scored removes
+both classes of error at once.
+
+**Precedent.** KernelBot's `benchmark.i.*` key set and `ranking_by` semantics
+(`/tmp/kb/src/libkernelbot/run_eval.py`), so the board renders with no changes
+on Mark's side.
+
+**Rejected.** Best-of-N (rewards a lucky call and an unstable learner);
+wall-clock only (kernelbot#295: the $100K AMD 2025 challenge ranked on CPU
+wall-clock with a hot L2 for its whole run); energy (no NVML on the KernelBot
+path, and Seth's PR #87 machinery needs SIGSTOP and root-ish access that a
+hosted runner will not give).
+
+### D2. Per-call protocol: fresh draw, staged untimed, L2 flushed, CUDA events, full synchronize, parent-side scoring
+
+**Decision.** `stage` (separate round trip, untimed), `synchronize`,
+256 MB L2 flush, `synchronize`, `start.record()`, `custom_kernel`,
+`end.record()`, `synchronize`, then validate (plain `torch.Tensor`, shape
+`(Q,)`, integer dtype, values in 0..9), copy to host, score in the parent.
+
+**Why.** The 2025 AMD challenge's timing loop reused inputs and left the L2 hot,
+which is worth an order of magnitude on a small tensor problem
+(kernelbot#295, reference-kernels#142). 256 MB rather than the AMD harness's
+`clear_l2_cache_large` 64 GiB: the A100's L2 is 40 MB.
+
+**Precedent.** `/tmp/rk/problems/amd_202602/eval.py`, the 2026 rewrite of that
+loop.
+
+**Rejected.** `torch.cuda.synchronize` on the default stream only (a side stream
+escapes it; see D4 and `redteam/timer-patch_sidestream.py`); invariant-only
+correctness checks (reference-kernels#148, which admit a cache).
+
+### D3. Exactly one untimed warm-up call, on a foreign dataset
+
+**Decision.** One unmeasured call before the timed loop. As of 1.1.0 that call
+is a Fashion-MNIST draw of identical shape.
+
+**Why.** Compilation, autotuning and CUDA graph capture should be free, as in
+modded-nanogpt. But the red team turned the free call into a free *training*
+budget: `threshold-gaming.py` fitted on the warm-up draw and replayed, for a
+2.71x discount, and `replay-cache_weights.py` got 9.4x the same way. A foreign
+warm-up keeps the compile free and makes the fitted model useless.
+
+**Precedent.** modded-nanogpt's untimed compile; reference-kernels#142 on warm-up
+input reuse arming replay paths.
+
+**Rejected.** No warm-up at all (the first call then measures `torch.compile`,
+which is not what anyone wants to rank); several warm-ups (more free budget).
+
+### D4. Trust boundary: spawned child, parent holds everything, four clocks
+
+**Decision.** The submission is imported only in a spawned child, on an explicit
+`load` command, after the protocol has been calibrated in a process that has no
+submission in it. The child captures `time.perf_counter`, `torch.cuda.Event`,
+`torch.cuda.synchronize`, the flush and every tensor method used for staging and
+readback into locals **before** the submission exists. Four clocks bracket each
+call: CUDA events in the child, the child's `perf_counter`, the parent's
+`perf_counter` around the call round trip, and the parent's around the staging
+round trip. `utils.timing_plausible` bounds the device clock from above by the
+child's wall clock and from below by both the child's wall clock (relative below
+1 ms) and `0.25 * (parent_round_trip - calibrated_overhead) - 0.5 ms`.
+
+**Why.** In-process timer monkeypatching put a fake 0.000 at #1 on a live board
+(reference-kernels#162). Version 1.0.0 of this harness had the same hole in a
+subtler form: its three checks compared two attacker-controlled numbers to each
+other, so scaling both by 1e-4 passed. That was worth 8,550x
+(`redteam/timer-patch.py`, before-fix evidence in `redteam/evidence/`).
+
+**Precedent.** reference-kernels#162; Seth's PR #87 trust boundary (parent holds
+the pool, labels, seeds and permutations, child never sees test labels), which
+this keeps.
+
+**Rejected.** Trusting CUDA events alone (`CUDA_EVENT_DISABLE_TIMING` is a
+KernelGuard rule family for a reason); a parent that never touches CUDA (it
+imports torch to resolve the device, which costs ~300 MB RSS and is worth it).
+
+### D5. The labels never touch disk while a submission is alive
+
+**Decision.** The parent downloads MNIST and Fashion-MNIST (md5-verified in
+`mnist_data.SOURCES`), loads them into RAM and deletes the files, then spawns
+the child. On Modal the files are baked into the image and consumed
+(`MNIST_POOL_CONSUME=1`). `MNIST_POOL_CACHE` exists for offline dry runs only.
+The evaluator re-execs itself once with `POPCORN_SEED` and `MNIST_POOL_CACHE`
+removed from its environment, receiving them on an inherited pipe.
+
+**Why.** `os.environ.pop` does not rewrite `/proc/<pid>/environ`. The io lens
+proved the child can read the parent's original environ; with the secret seed
+plus `combine` plus the public case seed, every draw, permutation and hold-out
+of the run is reconstructible. Confirmed on the container:
+`proc_environ_readable=true` under gVisor, and `parent_POPCORN_SEED=null`
+(`results/gpu-07-10-io-and-process-12pct.json`).
+
+**Precedent.** The Sutro-specific hole: medium draws from the public 60k MNIST
+*train* split, so the labels are published and a disk copy is a free win.
+
+**Rejected.** Relying on `os.environ.pop` (does not work); leaving the cache env
+var set on a hosted run (an operator convenience that hands the pool over).
+
+### D6. A learning check on foreign data, timed and ranked
+
+**Decision.** `holdout_draws` (2) Fashion-MNIST calls of identical shape at
+positions only the evaluator knows, interleaved with the ranked calls, **timed
+and ranked like every other call**, scored in aggregate against
+`holdout_min_bp` (3000 bp = 70%).
+
+**Why.** MLPerf's open-division rule: the implementation must not encode
+information about the dataset's content or a successful model's state. A
+memorizer cannot answer an unseen dataset. Making the hold-out ranked removes
+the free compute slot the red team used: 1.0.0's untimed hold-out let an entry
+keep a slow honest learner for unknown draws at zero ranking cost.
+
+**Precedent.** MLPerf 2.4 learning policy; reference-kernels#148 on
+invariant-only checks.
+
+**Rejected.** An untimed hold-out (a free slot, exploited); a 50% floor (nearest
+class mean scores 66.5% on Fashion 9x9 and cleared it). Measured on the A100:
+`pca_qda` 78.0%, `cg_pair` 88.2%, `mlp512` **47.8%**. The last one is an honest
+learner that fails; see section 6.
+
+### D7. Every threshold is a case field, and case fields come from one JSON file
+
+**Decision.** `size`, `train`, `test`, `error_bp`, `draws`, `bench_draws`,
+`seed`, `holdout`, `holdout_draws`, `holdout_min_bp`, `max_call_ms`,
+`warmup_max_call_ms`, `draw_slack_bp`, `dispersion_x10`, `max_source_bytes`,
+`max_literal_bytes`. All documented in `task.py:TestSpec`, all defaulted in
+`bands.json`, all reaching KernelBot only through generated `task.yml` case
+lines. `make_bands.py` regenerates every band folder plus `sutro.yaml`.
+
+**Why.** You said the thresholds will move. A band change must not be a code
+change, and a hosted competition cannot be edited mid-flight
+(kernelbot#295 again: the harness could not be fixed once the $100K challenge
+was live).
+
+**Precedent.** reference-kernels `task.yml` `tests:` / `benchmarks:` case lines.
+
+**Rejected.** Constants in `eval.py`; a band per branch.
+
+### D8. Four modes with KernelBot's exit codes
+
+**Decision.** `test` (1 draw, format plus a loose gate at `error_bp + 1000`),
+`benchmark` (`bench_draws` = 3, no hold-out), `leaderboard` (full `draws` plus
+hold-out), `profile` (base64 `torch.profiler` table). Exit 0 / 112 fail / 111 no
+`POPCORN_FD` / 113 bad cases file. Timeouts 300 / 600 / 1200 s.
+
+**Why.** KernelBot runs test then benchmark then leaderboard as three fresh
+processes and stops at the first failure; matching that exactly means Mark
+changes nothing.
+
+**Precedent.** `/tmp/kb/src/libkernelbot/run_eval.py`, `run_pytorch_script`.
+
+**Rejected.** A single mode (participants then cannot smoke-test cheaply);
+the 180 s default timeouts (too short: `mlp512`'s leaderboard step took 382 s).
+
+### D9. A CPU dry-run path that runs the identical protocol
+
+**Decision.** `MNIST_EVAL_DEVICE=cpu` or no CUDA gives the same code path with
+`perf_counter` in place of events and no L2 flush. `run_modal.py --local`
+exercises the whole KernelBot pipeline without Modal.
+
+**Why.** Everything in this project was developed and red-teamed on a Mac with
+no GPU. 28 unit tests and 40-odd exploit runs happened before a single A100
+minute was spent.
+
+**Precedent.** None in GPU MODE; this is a local requirement.
+
+**Rejected.** GPU-only development. Note the cost of the choice: the one blocker
+of the GPU stage was precisely a CUDA path that the CPU dry run treats as a
+no-op (section 7).
+
+### D10. Versions in the result keys
+
+**Decision.** `system.harness`, `system.torch`, `system.cuda`, `system.device`,
+`system.device_count`, `system.capability`, `system.numpy`, `system.python`,
+`system.platform`, `system.driver`.
+
+**Why.** reference-kernels#143: participants cannot see the evaluator version,
+so a silent change invalidates records nobody can audit. Rule 7 of the README
+depends on this key existing.
+
+**Precedent.** #143, and #164 / #140 / #23 on buggy references becoming the spec.
+
+**Rejected.** Nothing, except that `system.driver` logs `unknown`: torch exposes
+no driver string. Cosmetic gap against D10, listed in section 7.
+
+## 3. Red-team results
+
+Five lenses, 35 exploit files in `redteam/`, all re-run behind 1.1.0 and then on
+the A100. "Before" is harness 1.0.0.
+
+| Lens | Exploit | Before (1.0.0) | After, on the A100 | Residual risk |
+| --- | --- | --- | --- | --- |
+| timer-patch | `redteam/timer-patch.py` | 0.008 ms ranked, 8,550x, pass | 4.311 ms, honest (`gpu-07-03-timer-patch-12pct.json`) | a 2-4x lie still passes |
+| timer-patch | `redteam/timer-patch_evalglobals.py` | 0.011 ms, pass | 4.523 ms, honest | same |
+| timer-patch | `redteam/timer-patch_calibration.py` | 8,710 ns, pass | 4.545 ms, honest | same |
+| timer-patch | `redteam/timer-patch_sidestream.py` | inert on CPU, untested | **defeated**: 23.967 ms, 5.3x *slower* than honest, because the captured barrier drains its side stream | none found |
+| timer-patch | `redteam/timer-patch_cellsteal.py` | n/a (written to test the fix) | caught: "device time 4.523 ms exceeds the child's wall clock 0.000 ms" | catches by the upper bound on CUDA, the lower bound on CPU |
+| lazy-output | `redteam/lazy-output.py` (`Tensor.copy_` staging hijack) | 0.0022 ms, 32,000x, pass | 24.683 ms, 5.4x slower than honest | half the work can still legally sit past the end event |
+| lazy-output | `redteam/lazy-output_postevent.py` | caught | caught: "0.132 ms is less than half the child's wall clock 0.608 ms" (the sub-ms relative form added in 1.1.0; the old 0.5 ms slack would have let it through) | none |
+| lazy-output | `redteam/lazy-output_subclass.py` | caught | caught (plain-tensor check) | none |
+| replay-cache | `redteam/replay-cache.py` | 12%, 5% and 2% bands passed with a 79% payload | caught: "draw 0 scored 7965 of 10000, below the per-draw floor 8650" | fails before any cache entry exists, so CUDA hash bit-stability is still unconfirmed |
+| replay-cache | `redteam/replay-cache_weights.py` | 9.4x discount, pass | caught: "call durations differ by 20.7x (worst 247.557 ms, median 11.978 ms)"; on CPU the same exploit only reached 7.7x | gate is a heuristic; a flat-profile cheat with a cheap fallback needs D3's foreign warm-up to be sound |
+| label-lookup | `redteam/label-lookup_fallback.py` | 2% band pass at 100.0000% accuracy, 517x | caught before the child is spawned: "submission.py is 330012 bytes, over the 20480-byte limit" | a <20 KB quantized net still scores ~98% on the public pool |
+| label-lookup | `redteam/label-lookup_probe.py` | 2% band pass at 100%, hold-out 80.2% (higher than the honest entry) | same pre-import rejection | the size cap is the only thing stopping it; a smaller net is not stopped |
+| label-lookup | `redteam/label-lookup_netprobe.py` | 3 of 5 egress channels reached the real MNIST label file during a passing run | **all five blocked**: urllib, `socket`, `_socket`, `importlib.reload(socket)`, and `subprocess curl` (exit 6, name resolution) | the last one is closed by Modal `block_network=True`, not by the harness |
+| io-and-process | `redteam/io-and-process_gpurecon.py` | 12% band pass at 100% by finding MNIST on disk | caught; recon confirms `proc_environ_readable=true` yet `parent_POPCORN_SEED=null`, `idx_gz_found=[]`, `eval`/`utils`/`mnist_data` all `ModuleNotFoundError`, cwd is `[submission.py, task.py]` | not a sandbox: same uid, writable filesystem |
+| io-and-process | `redteam/io-and-process_fdwrite.py` | caught (fd already dead) | caught | none |
+| threshold-gaming | `redteam/threshold-gaming.py` (untimed warm-up as a training budget) | 2.71x discount, pass | caught: "call durations differ by 10.2x (worst 354.899 ms, median 34.931 ms)"; on CPU it merely came out honest | none found |
+| threshold-gaming | `redteam/threshold-gaming_margin11.py`, `_margin.py` | 1.73x by running a good learner on 7 of 11 draws | caught by the per-draw floor (CPU; not re-run on GPU, `--case` env forwarding) | floor slack of 150 bp is a policy choice |
+| threshold-gaming | `redteam/threshold-gaming_edge_gpufd.py` (fd scribbling) | **wedged the evaluator for 300 s with no result at all** | caught in 157 s: "the submission did not return from 'untimed' within 150 s"; 14 forged `check: pass` writes on inherited fds, none of them the result pipe | 143 s of margin under the 300 s test timeout, and only because `warmup_max_call_ms` was lowered to 120 s |
+| threshold-gaming | `redteam/threshold-gaming_forge.py` | caught | caught (CPU) | none |
+
+The full before-state evidence is in `redteam/evidence/` and
+`redteam/logs/`; the post-fix CPU re-runs are `results/after-fix-*.json` and the
+GPU verdicts are `results/gpu-07-*.json`.
+
+## 4. What is parameterized, and how to change a threshold
+
+Everything a band can vary lives in **`bands.json`** and nowhere else.
+`defaults{}` applies to every band; any key can be overridden per band.
+
+```bash
+$EDITOR bands.json
+python make_bands.py          # rewrites mnist-medium-*/task.yml and sutro.yaml
+python make_bands.py --check  # CI: fails if anything is stale
+```
+
+`make_bands.py` also regenerates `bands.md` and the band table inside
+`README.md`; a unit test asserts the three agree.
+
+**To add the 15% entry band:** append to `bands[]`
+
+```json
+{ "name": "mnist-medium-15pct", "error_bp": 1500, "label": "15%" }
+```
+
+**To add the 1.6% top band:**
+
+```json
+{ "name": "mnist-medium-1p6pct", "error_bp": 160, "label": "1.6%" }
+```
+
+then `python make_bands.py`. A new folder `mnist-medium-1p6pct/` appears with a
+`task.yml` and a `README.md`, and `sutro.yaml` gains the problem entry. Nothing
+in `eval.py` changes. Note for 1.6%: the best measured entry here is 97.93%, so
+that band currently has no qualifier at all (section 6).
+
+**To change the gates rather than the bands:** `draw_slack_bp` (per-draw floor
+under the aggregate rule, 150 bp), `dispersion_x10` (ten times the allowed
+worst/median ratio, 20), `holdout_min_bp` (3000), `holdout_draws` (2),
+`max_call_ms` (60000), `warmup_max_call_ms` (120000), `max_source_bytes`
+(20480), `max_literal_bytes` (4096), `draws` (11), `bench_draws` (3). Same
+edit-and-regenerate loop.
+
+## 5. Hosting: what Mark needs
+
+**Files to copy** into `reference-kernels/problems/sutro_mnist/` (the
+`directory:` fields in `sutro.yaml` already say `sutro_mnist/<band>`):
+
+| From `gpumode/` | Role |
+| --- | --- |
+| `eval.py`, `utils.py`, `task.py`, `mnist_data.py`, `reference.py`, `submission.py` | the shared problem files each `task.yml` lists |
+| `mnist-medium-*/task.yml` | one problem per band, generated |
+| `mnist-medium-*/README.md` | per-band blurb, generated |
+| `sutro.yaml` | the competition file: deadline `2026-12-31 23:59`, five problems, `gpus: [A100]` each |
+| `README.md`, `assets/mnist-medium-task.png` | what participants read |
+| `bands.json`, `make_bands.py` | so a band can be moved without editing code |
+
+`submissions/`, `redteam/`, `results/`, `tests/`, `run_modal.py` and
+`DESIGN.md` are ours, not the hosted problem, but `redteam/` is worth handing
+over as a regression suite.
+
+**GPU string.** `A100`, exactly as `consts.ModalGPU.A100`. See the board-variant
+problem in section 6 before accepting that as final.
+
+**Timeouts** (already in each `task.yml`): `test_timeout: 300`,
+`benchmark_timeout: 600`, `ranked_timeout: 1200`. The 180 s defaults are not
+enough: `mlp512`'s test step alone took 72 s and its leaderboard step 382 s.
+
+**A100-minutes per submission**, measured end to end including container start:
+
+| Entry class | Measured | Source |
+| --- | ---: | --- |
+| fast entry (4.5 ms/call), full test + benchmark + leaderboard | 49 s | `gpu-02` |
+| mid entry (270 ms/call), same | 42 s | `gpu-03b` |
+| slow entry (26.5 s/call), same | 587 s | `gpu-04` |
+| a rejected entry | 19 to 39 s | `gpu-05`, `gpu-07-*` |
+| a hanging entry, killed by the watchdog | 169 s | `gpu-07-11` |
+
+Budget about one A100-minute per ordinary ranked submission and ten for the
+slowest band-legal entry. The whole 25-run validation session was 32.1 minutes.
+
+**Artifact sizes.** The result channel is about 1.5 KB of `key: value` lines per
+mode, well inside the 64 KiB pipe buffer that KernelBot only drains after
+`eval.py` exits. Do not add raw record dumps without switching to a
+concurrently drained pipe. The `profile` mode report is a base64 profiler table,
+about 6 KB (`results/gpu-08-pca-qda-profile.json`).
+
+**Image.** `nvidia/cuda:13.3.0-devel-ubuntu24.04` + `add_python="3.13"` +
+`torch==2.12.0` + `numpy~=2.3`, which resolved as `torch 2.12.0+cu130` with no
+change needed. Build is about 3 s warm. `block_network=True` is required: it is
+the only thing that closes `subprocess curl`.
+
+**What this harness cannot give him.**
+
+* **Energy.** No NVML, no SIGSTOP idle subtraction, nothing from Seth's PR #87
+  survived. Time only.
+* **Per-board normalization.** There is no correction factor between the 40 GB
+  and 80 GB A100. The harness records `system.device`; it does not rank across
+  variants, and it cannot.
+* **Secret-seed rotation.** KernelBot's `secret_seed` is a leaderboard column
+  defaulted at creation, so README rule 6 (rerun the top three on a fresh seed)
+  has to happen outside the hosted service.
+* **Static screening.** No KernelGuard-style source analysis. Complementary and
+  worth running on the top of each band.
+
+## 6. Open decisions for Yaroslav
+
+1. **40 GB vs 80 GB A100.** The same computation is 4.5% faster on the 80 GB
+   board, about 5x the cross-container noise and 20x the within-run noise. As it
+   stands a leaderboard ranks entries partly by which board they landed on.
+   Options: pin `A100-40GB` in `sutro.yaml` (Modal accepts the variant strings,
+   but KernelBot's `ModalGPU.A100` is the bare one, so this needs Mark);
+   or record `system.device` and refuse to rank across variants; or accept a
+   4.5% noise floor. Worth raising with Mark directly, since it is a property
+   of the KernelBot runner, not of this harness.
+2. **The hold-out floor rejects an honest learner.** `mlp512` scores 96.4% on
+   MNIST over 11 draws and then fails at 47.79% on Fashion, with per-draw
+   `[8548, 1010]` at seed 20260922 and `[8463, 1010]` at seed 777. The same
+   1010 both times is chance for a 10k draw: the network deterministically
+   diverges, because its hand-tuned constant learning rate (0.1, squared error,
+   `x*4-0.5`) is tuned for sparse 9x9 digits and Fashion's denser images blow
+   the step size up. D6 assumed a real learner generalizes to foreign data of
+   the same shape; a learner with hand-tuned constants does not have to, and
+   the strong entries are exactly the ones with hand-tuned constants. Choices:
+   score the hold-out on its *best* draw rather than in aggregate; normalize
+   hold-out inputs to MNIST's pixel statistics; drop `holdout_min_bp` to about
+   1500 (a lookup-table entry still scores ~10%, so separation survives); or
+   require only a wide margin over chance. Measured floors to calibrate
+   against: `pca_qda` 77.4 to 78.0%, `cg_pair` 88.2%, `mlp512` 47.8%, nearest
+   class mean 66.5% (CPU).
+3. **The 2% band has no qualifier.** `cg_pair` scores 97.837% over the
+   benchmark draws and 97.932% over 11 ranked draws against a 98.000%
+   requirement, and the GPU per-draw counts reproduce the CPU dry run to within
+   one prediction, so upstream's self-reported 98.12% is about 0.2 points
+   optimistic under this protocol. Because every test half of a run comes from
+   the same 30k universe, a run has roughly the precision of one 30k test set,
+   not of 110k, so re-seeding moves the number by tenths of a point rather than
+   averaging the miss away. Either open 2% knowing its only known entry misses,
+   or move the band. The 1.6% band under discussion is further still.
+4. **Mean or median as the ranked value.** Currently mean, matching KernelBot.
+   Measured within-run std is 0.2 to 0.4% for every honest entry, so it makes
+   almost no difference today; median is more robust if a band ever admits an
+   entry with a bimodal call.
+5. **Should compile and graph capture stay untimed?** D3 says yes, and it costs
+   a foreign-dataset warm-up call to keep safe. The alternative, timing the
+   first call, would rank `torch.compile` rather than the learner and would make
+   CUDA-graph entries look terrible. Worth a deliberate answer since the answer
+   is what the board actually measures.
+6. **Test mode on the public seed.** `test_seed: 101` and `benchmark_seed: 202`
+   are public and combined with the secret, so nobody can precompute a draw, but
+   a participant can rehearse against a fixed public case repeatedly. That is
+   intended (cheap smoke tests) but it also means `benchmark` mode, which runs
+   no hold-out, is a rehearsal surface for a memorizer. Consider whether
+   `benchmark` should also run one hold-out call.
+7. **Deadline.** `bands.json` says `2026-12-31 23:59`, a placeholder.
+8. **Timeout headroom at the slow end.** `max_call_ms` is 60 s while
+   `ranked_timeout` is 1200 s, and `mlp512` at 26.5 s/call already uses 382 s of
+   it. An entry 3x slower times out before the per-call limit ever fires. Either
+   lower `max_call_ms` to about 40 s or raise `ranked_timeout`, before opening a
+   band to slow entries.
+
+## 7. Findings and surprises from the GPU runs
+
+**The blocker, fixed.** The first GPU run failed on the harness's own honest
+baseline: `timing implausible on call 0: device time 1.004 ms is under 0.25 of
+the 11.203 ms the parent measured for this call (round trip 12.507 ms minus
+1.304 ms of calibrated overhead)`. `probe_call`, documented as "a timed call
+with no submission in it", skipped the `synchronize / flush_l2 / synchronize`
+preamble that opens every timed call. That sequence is a no-op on the CPU dry
+run, so the omission was invisible to all 28 unit tests and 40-odd CPU exploit
+runs. On an A100 it costs about 10 ms, almost all of it the *first* allocation
+of the 256 MB flush buffer, which then landed on timed call 0. `ipc_ms`
+under-measured the protocol by that amount, the budget was inflated by the same
+amount, and every submission faster than about 3 ms was disqualified. Since a
+leaderboard run starts with `test`, no fast entry could have been scored at all.
+`probe_call` now runs the same preamble. The timed window and the ranked value
+are untouched; 28/28 unit tests still pass. This was the only scoring-path edit
+made during the GPU stage.
+
+**`gpu="A100"` is two different boards.** 23 of 25 containers were
+A100-SXM4-40GB (1555 GB/s HBM2), 2 were A100-SXM4-80GB (2039 GB/s HBM2e). The
+identical pca-qda computation: 4.311 ms on the 80 GB board against 4.504,
+4.523, 4.535, 4.545 and 4.547 ms on five separate 40 GB containers.
+
+**Two gates are stronger on the GPU than on CPU.** `replay-cache_weights` was
+caught at 20.7x dispersion (7.7x on CPU); `threshold-gaming` was rejected
+outright at 10.2x, where on CPU it had merely come out honest. Real device
+timing separates a trained call from a replayed one much more sharply.
+
+**The genuinely untested exploit was fully neutralized.**
+`redteam/timer-patch_sidestream.py` forces `enable_timing=False`, returns a
+constant 0.01 ms from `elapsed_time`, replaces `torch.cuda.synchronize` with a
+default-stream-only synchronize, and issues the learner on a private side
+stream with a deferred join. None of it reached the evaluator, which holds its
+own pre-import `Event` and `synchronize`. It ranked at 23.967 ms, 5.3x *slower*
+than its honest 4.5 ms, because the captured barrier drains its side stream.
+The pre-import capture is what does the work.
+
+**Two verdicts differ from what `tests/GPU_CHECKS.md` predicted, in detail
+though not in outcome.** (a) `timer-patch_cellsteal` is caught by the upper
+bound ("device time 4.523 ms exceeds the child's wall clock 0.000 ms") rather
+than the parent-clock bound that catches it on CPU: on CUDA the `gc` walk
+reaches the captured `perf_counter` cell but not the captured `Event`, so the
+child's wall clock reads zero while the device clock stays honest. (b)
+`ncm_baseline`'s leaderboard control fails on the per-draw floor rather than
+the aggregate accuracy gate, because the floor is evaluated per call and fires
+at draw 0. Both are correct rejections; the expected strings in the checklist
+should be updated.
+
+**The Linux-only defences hold.** `/proc/<ppid>/environ` *is* readable under
+gVisor, so the threat was real, and yet `parent_POPCORN_SEED=null` and
+`parent_MNIST_POOL_CACHE=null`: the re-exec scrub works on real Linux, which
+was the single biggest untested assumption. Also confirmed: `idx_gz_found=[]`,
+`cases_files={}`, `cwd_listing=['__pycache__','submission.py','task.py']`, and
+`eval`/`utils`/`mnist_data` all `ModuleNotFoundError`. Only
+`parent_POPCORN_FD='12'` leaks, which is a number and not a writable fd.
+
+**All five egress channels are blocked on the real container**, against four of
+five on CPU. `subprocess curl` returns exit 6, could not resolve host, i.e.
+Modal's `block_network=True` closes the channel the in-process guard cannot.
+
+**Capacity waits: none.** Zero capacity, queue or resource errors across all 25
+runs; the exponential-backoff path in `run_on_modal` never fired. Every
+container started within a few seconds of `app.run()`.
+
+**Things against expectation.** `pca_qda` came in at 4.55 ms, not the 3 to 4 ms
+the brief expected. `cg_pair` came in at 270 ms and 97.93%, against ~260 ms and
+98.12% upstream.
+
+**What did not run.** `mlp512` on the 8% band (it fails on the hold-out, not on
+accuracy, so the result is identical and it costs ~10 min of GPU time);
+`redteam/threshold-gaming_clock.py` and `threshold-gaming_margin11.py` on the
+GPU, because `run_modal.py`'s `remote_evaluate` passes `env_extra={}` and does
+not forward environment variables or `--case` overrides into the container
+(both were verified on CPU; an `--env` passthrough is a small change). The
+replay-cache GPU sub-question is still open: that exploit fails at draw 0,
+before any cache entry exists, so this run does **not** confirm that the int64
+pixel hash is bit-stable across calls on CUDA after the 256 MB flush
+(`tests/GPU_CHECKS.md` 2.7 asks for that, and it needs a purpose-built probe).
+
+**Cosmetic.** `system.driver` logs `unknown`: torch exposes no driver string,
+so that D10 field is empty. And `tests/test_web.py` errors with
+`ModuleNotFoundError: fastapi`, pre-existing, from a parallel agent's
+`gpumode/web/`; `tests/test_eval.py` is 28/28.
+
+## Harness changes from red-teaming (2026-09-22, harness 1.0.0 -> 1.1.0)
+
+Five agents attacked harness 1.0.0; their submissions are in `redteam/` and the
+escapes they found are listed with the fix that closed each one. Every fix was
+re-run against the exploit that motivated it, on the CPU dry-run path.
+
+**Clocks (lens: timer-patch, threshold-gaming escape 3, lazy-output)**
+
+1. The child now captures `time.perf_counter`, `torch.cuda.Event`,
+   `torch.cuda.synchronize`, the L2 flush and every tensor method used to stage
+   inputs and read outputs into locals *before* the submission is imported, and
+   uses only those. Rebinding them -- in the stdlib, in `torch`, or by rewriting
+   the evaluator module's `__globals__` -- no longer reaches anything the
+   harness measures. Closes `timer-patch.py`, `timer-patch_evalglobals.py`,
+   `timer-patch_calibration.py`, `threshold-gaming_clock.py` and the
+   `Tensor.copy_` staging hijack in `lazy-output.py`.
+2. The submission is imported on a `load` command rather than at process start,
+   so the evaluator can calibrate the protocol's own cost (`probe` and `stage`
+   round trips) in a process that has no submission in it. This is what makes a
+   poisoned calibration impossible (`timer-patch_calibration.py` slowed exactly
+   the probe's signature to make the budget negative).
+3. `utils.timing_plausible` gained a lower bound against the parent's clock:
+   `device_ms >= 0.25 * (parent_round_trip - calibrated_overhead) - 0.5`. The
+   staging round trip, which carries 6.5 MB, is a separate message with its own
+   ceiling, so the transfer cost does not loosen the bound on the call. The old
+   `0.5 * child_wall - 0.5` bound became relative below a millisecond.
+4. `benchmark.i.wall_mean` is now the parent's clock, as D1 always said it was;
+   the child's is logged separately as `child_wall_mean`, alongside
+   `stage_mean`, `ipc_calibration`, `stage_calibration`, `loop_wall` and the
+   per-call `durations` list.
+
+**Replay and carry-over (lens: replay-cache, threshold-gaming escape 1)**
+
+5. The pool is cut in half once per run from the secret seed, and training
+   halves are drawn from one half and test halves from the other. Every draw
+   used to re-split the same 60,000 rows, so 1 - (5/6)^k of the test images of
+   draw k had already arrived, labelled, in an earlier training half: a hash
+   table reached 98% with a 79% payload. Closes `replay-cache.py` and
+   `replay-cache_persist.py`.
+6. The warm-up call is now a Fashion-MNIST draw of identical shape. Compilation,
+   autotuning and graph capture stay free; a model fitted during the warm-up is
+   about the wrong dataset. Closes the free training budget used by
+   `threshold-gaming.py` (2.7x) and `replay-cache_weights.py` (9.4x).
+7. A dispersion gate fails a run whose slowest ranked call exceeds
+   `dispersion_x10/10` times the median plus 2 ms. Training on call 1 and
+   reusing it for calls 2..11 is exactly this shape.
+
+**Accuracy gaming (lens: threshold-gaming escape 2)**
+
+8. A per-draw floor (`draw_slack_bp`, 150 bp) sits under the aggregate rule.
+   Mixing an accurate learner on 7 of 11 draws with a cheap one on the rest used
+   to clear the mean by 435 of 110,000; now the cheap draws fail on their own.
+   150 bp rather than the 100 bp the red team proposed: the measured per-draw
+   scatter of `cg_pair` at the 2% band is about +/- 30 of 10,000, and 100 bp
+   left under two standard deviations of headroom.
+
+**Memorization (lens: label-lookup, io-and-process)**
+
+9. `submission.py` is capped at `max_source_bytes` (20,480) with no literal over
+   `max_literal_bytes` (4,096), checked by `ast` before the child is spawned.
+   Rule 2 was an honour rule; it is now machine-checked. Closes all four
+   table-carrying and pretrained-net variants of `label-lookup*.py` (141-330 KB).
+10. Hold-out calls are `holdout_draws` (2) Fashion-MNIST draws at secret
+    positions, timed and ranked like every other call, and scored in aggregate
+    against `holdout_min_bp`, raised from 5000 bp (50%) to 3000 bp (70%) so a
+    nearest-class-mean alibi (66.5%) no longer clears it. They are no longer a
+    free compute slot.
+
+**Process and I/O (lens: io-and-process)**
+
+11. The submission runs in a private directory containing only `submission.py`
+    and `task.py`; the harness directory is removed from `sys.path` and the
+    harness modules are removed from `sys.modules`, so `eval`, `utils`,
+    `mnist_data`, `combine`, the draw constants and the cases file (with its
+    public seed) are all unreachable. A fresh directory per phase, deleted after.
+12. The evaluator re-execs itself once with `POPCORN_SEED` and
+    `MNIST_POOL_CACHE` removed from its environment, receiving them on an
+    inherited pipe. `os.environ.pop` does not rewrite `/proc/<pid>/environ`, so
+    without this a child could read the parent's secret seed and reconstruct
+    every draw, permutation and hold-out of the run.
+13. `install_network_guard` installs an audit hook (permanent, C-level) in
+    addition to the monkeypatches. `_socket.socket().connect` and
+    `importlib.reload(socket)` both escaped the monkeypatches and were verified
+    to fetch the real MNIST label file; both are now refused. The hook also
+    denies opening files whose names look like datasets. `subprocess curl` still
+    escapes -- it is a fresh interpreter -- so `run_modal.py` sets
+    `block_network=True` and the pools are baked into the image, loaded into RAM
+    and deleted before any submission process exists.
+14. The child calls `setsid`, and the parent kills its process group, so a
+    detached process or thread cannot outlive the evaluation.
+
+**Availability**
+
+15. `Child.call` waits with a deadline (`max_call_ms` + 30 s for timed calls,
+    `warmup_max_call_ms` + 30 s for the warm-up) enforced by a watchdog that
+    kills the process group. `poll` alone is not enough: a submission that
+    writes on low file descriptors corrupts the pipe, after which `poll` reports
+    data while `recv` blocks forever on a message that never arrives. That
+    variant (`threshold-gaming_edge.py REDTEAM_EDGE=fd`) used to hang the
+    evaluator until KernelBot's mode timeout killed it with no result at all;
+    it now fails in 55 s with "the submission did not return from 'untimed'
+    within 50 s".
+
+**Parameters added to `task.yml` / `bands.json`**
+
+`holdout_draws` (2), `draw_slack_bp` (150), `dispersion_x10` (20),
+`warmup_max_call_ms` (120000), `max_source_bytes` (20480),
+`max_literal_bytes` (4096); `holdout_min_bp` default 5000 -> 3000. All still
+live in `bands.json` and reach KernelBot only through generated `task.yml` case
+lines.
+
+### Two consequences worth knowing about
+
+*Accuracy is measured on a smaller universe.* Because the test halves of a run
+all come from the same 30,000-image half of the pool, the 11 ranked draws
+overlap heavily and are no longer independent samples: the run-level accuracy
+estimate has roughly the precision of one 30,000-example test set, not of
+110,000. Band margins should be measured across several secret seeds, not one.
+In the CPU re-run under seed 20260922, `cg_pair` scored 97.83% over three draws
+against the 2% band's 98.00% -- upstream reports 98.12%, so that band sits
+exactly at this entry's capability and needs a decision (move the band, or
+accept that the entry sometimes misses).
+
+*The hold-out calls are in the ranked mean.* A submission's published time is
+now the mean over 11 MNIST calls and 2 Fashion calls. That is deliberate -- an
+untimed hold-out is a free compute slot -- but it means times from harness
+1.0.0 are not comparable with times from 1.1.0, and rule 7 (re-score standing
+records when the evaluator changes) applies.
+
+### What the re-run showed
+
+| Exploit | Before | After |
+| --- | --- | --- |
+| `timer-patch.py` | 0.008 ms ranked, 8,550x | 67.2 ms, honest; the lie has no effect |
+| `timer-patch_evalglobals.py` | 0.011 ms ranked | 59.8 ms, honest |
+| `timer-patch_calibration.py` | 8,710 ns ranked | 62.9 ms, honest |
+| `lazy-output.py` | 0.0022 ms, 32,000x | 58.2 ms, honest |
+| `lazy-output_postevent.py` | caught (timing) | caught (per-draw floor; the patched `min` never runs) |
+| `lazy-output_subclass.py` | caught | caught |
+| `replay-cache.py` | 12% band pass at 94.9% | fail: draw 0 at 7,965 of 10,000, below the floor |
+| `replay-cache_persist.py` | 2% and 5% bands pass | fail: same |
+| `replay-cache_weights.py` | 9.4x discount, pass | fail: durations differ by 7.7x |
+| `replay-cache_naive.py` | caught (accuracy) | caught (timing, on call 0) |
+| `label-lookup{,_fallback,_pretrained,_probe}.py` | 2 of 4 escaped at 100% | all four rejected before import: over the size cap |
+| `label-lookup_netprobe.py` | 3 of 5 channels reached the internet | 4 of 5 blocked; `subprocess curl` needs the container block |
+| `io-and-process.py` | 12% band pass at 100% by disk lookup | fail: harness unimportable, dataset files denied, falls back to 79% |
+| `threshold-gaming.py` | 2.71x from the untimed warm-up | 60.9 ms, honest |
+| `threshold-gaming_margin11.py` | 1.73x by mixing 7 good draws in 11 | fail: draw 7 scored 8,002, floor 8,650 |
+| `threshold-gaming_margin.py` | pass at 91.3% | fail: draw 2 below the per-draw floor |
+| `threshold-gaming_clock.py` | 1,021x | 62.5 ms, honest |
+| `threshold-gaming_slowcall.py` | caught after the fact | caught, and a hanging call is now killed |
+| `threshold-gaming_forge.py` | caught (fd already dead) | caught |
+| `timer-patch_cellsteal.py` (new, written to test the fix) | n/a | caught: it does overwrite the evaluator's captured clock through `gc`, and the parent's clock rejects the call -- "device time 0.003 ms is under 0.25 of the 29.015 ms the parent measured" |
+
+GPU-only checks that this pass could not run are listed in
+[`tests/GPU_CHECKS.md`](tests/GPU_CHECKS.md).
+
+## Harness change from the first A100 run (2026-09-22, harness 1.1.0)
+
+One change to `eval.py` was needed before anything could run on real hardware,
+and it is the only scoring-path edit made during the GPU stage.
+
+**`probe_call` now runs the same CUDA preamble as `timed_call`.** The
+calibration probe is documented as "a timed call with no submission in it", but
+it skipped the `synchronize / flush_l2 / synchronize` sequence that opens every
+timed call. On the CPU dry-run path that sequence is a no-op, so the omission
+was invisible. On an A100 it is not: the two barriers plus the *first*
+allocation of the 256 MB L2 flush buffer cost about 10 ms, and all of it sits
+inside the parent's round trip of a timed call while sitting outside the child's
+wall clock. `ipc_ms` therefore under-measured the protocol by roughly 10 ms, the
+budget `parent_wall - ipc` was inflated by the same amount, and the
+parent-clock bound `device >= 0.25 * budget - 0.5 ms` rejected honest
+millisecond kernels:
+
+    timing implausible on call 0: device time 1.004 ms is under 0.25 of the
+    11.203 ms the parent measured for this call (round trip 12.507 ms minus
+    1.304 ms of calibrated overhead)
+
+That was the nearest-class-mean baseline, in `test` mode, on the 12% band --
+i.e. every submission faster than ~3 ms was disqualified, and since a
+leaderboard run begins with `test`, no fast entry could have been scored at all.
+Running the preamble in the probe fixes both halves: the flush buffer is
+allocated during calibration rather than on timed call 0, and `ipc_ms` measures
+what a timed call actually costs outside the kernel. The timed window itself is
+untouched, so the ranked number means exactly what it meant before. After the
+change `ipc_calibration` lands at 0.75-1.44 ms and the parent's clock agrees
+with the device clock to within 1.3 ms on every reference submission.
+
+Two red-team variants were added so that two GPU-only checks could run without
+environment forwarding into the container:
+`redteam/io-and-process_gpurecon.py` (identical, plus a stderr dump of the recon
+dictionary) and `redteam/threshold-gaming_edge_gpufd.py` (`REDTEAM_EDGE`
+defaults to `fd`).
