@@ -1,6 +1,9 @@
 # MNIST-medium time leaderboard: design report
 
-Harness `sutro-mnist-medium-time/1.1.0`, 2026-09-22. Reader: Yaroslav.
+Harness `sutro-mnist-medium-time/1.1.1`, 2026-09-22. Reader: Yaroslav.
+Section 10 lists the changes an independent audit of 1.1.0 produced; every
+number measured on hardware below was taken with 1.1.0 and is unaffected by
+them, except where section 10 says otherwise.
 Source of every number below: `gpumode/results/gpu-*.json` (one A100 on Modal,
 25 sequential containers, 1923 s = 32.1 min of GPU wall time) and
 `gpumode/results/cpu-*.json` (CPU dry runs). Code: `gpumode/eval.py`,
@@ -247,7 +250,10 @@ no-op (section 7).
 
 **Why.** reference-kernels#143: participants cannot see the evaluator version,
 so a silent change invalidates records nobody can audit. Rule 7 of the README
-depends on this key existing.
+depends on this key existing. `system.driver` is read through
+`torch.cuda.driver_version()` with `torch._C._cuda_getDriverVersion()` as the
+fallback, after `torch.cuda.init()`; if both fail the key carries the exception
+instead of a bare `unknown`.
 
 **Precedent.** #143, and #164 / #140 / #23 on buggy references becoming the spec.
 
@@ -296,8 +302,11 @@ python make_bands.py          # rewrites mnist-medium-*/task.yml and sutro.yaml
 python make_bands.py --check  # CI: fails if anything is stale
 ```
 
-`make_bands.py` also regenerates `bands.md` and the band table inside
-`README.md`; a unit test asserts the three agree.
+`make_bands.py` also regenerates `bands.md`, the band table inside `README.md`
+(spliced between the `GENERATED` and `END GENERATED` markers) and one
+`<band>/submission.py` per band carrying that band's `#!POPCORN leaderboard`
+line, so `--check` covers all of them and a downloaded template cannot post to
+the wrong board. A unit test asserts the table and `bands.json` agree.
 
 **To add the 15% entry band:** append to `bands[]`
 
@@ -333,6 +342,7 @@ edit-and-regenerate loop.
 | `eval.py`, `utils.py`, `task.py`, `mnist_data.py`, `reference.py`, `submission.py` | the shared problem files each `task.yml` lists |
 | `mnist-medium-*/task.yml` | one problem per band, generated |
 | `mnist-medium-*/README.md` | per-band blurb, generated |
+| `mnist-medium-*/submission.py` | the per-band starter template, generated (its `#!POPCORN leaderboard` line names its own band) |
 | `sutro.yaml` | the competition file: deadline `2026-12-31 23:59`, five problems, `gpus: [A100]` each |
 | `README.md`, `assets/mnist-medium-task.png` | what participants read |
 | `bands.json`, `make_bands.py` | so a band can be moved without editing code |
@@ -382,8 +392,11 @@ the only thing that closes `subprocess curl`.
 * **Secret-seed rotation.** KernelBot's `secret_seed` is a leaderboard column
   defaulted at creation, so README rule 6 (rerun the top three on a fresh seed)
   has to happen outside the hosted service.
-* **Static screening.** No KernelGuard-style source analysis. Complementary and
-  worth running on the top of each band.
+* **Static screening.** KernelBot runs its own KernelGuard precheck
+  (`enforce_submission_precheck`) before the evaluator, so replay, hardcoded
+  shapes and trivial-work screening is hosting behaviour we inherit rather than
+  a gap. This harness adds only the size caps and the module-level inertness
+  check; a human read of the top of each band is still worth it.
 
 ## 6. Open decisions for Yaroslav
 
@@ -511,10 +524,11 @@ the brief expected. `cg_pair` came in at 270 ms and 97.93%, against ~260 ms and
 
 **What did not run.** `mlp512` on the 8% band (it fails on the hold-out, not on
 accuracy, so the result is identical and it costs ~10 min of GPU time);
-`redteam/threshold-gaming_clock.py` and `threshold-gaming_margin11.py` on the
-GPU, because `run_modal.py`'s `remote_evaluate` passes `env_extra={}` and does
-not forward environment variables or `--case` overrides into the container
-(both were verified on CPU; an `--env` passthrough is a small change). The
+`redteam/threshold-gaming_clock.py` on the GPU, because it is driven by an
+environment variable and `run_modal.py`'s `remote_evaluate` used to pass
+`env_extra={}` (`--case` overrides *were* forwarded all along, so
+`threshold-gaming_margin11.py --case bench_draws=11` could have run; both were
+verified on CPU). `run_modal.py` now has an `--env K=V` passthrough. The
 replay-cache GPU sub-question is still open: that exploit fails at draw 0,
 before any cache entry exists, so this run does **not** confirm that the int64
 pixel hash is bit-stable across calls on CUDA after the 256 MB flush
@@ -625,8 +639,10 @@ re-run against the exploit that motivated it, on the CPU dry-run path.
     data while `recv` blocks forever on a message that never arrives. That
     variant (`threshold-gaming_edge.py REDTEAM_EDGE=fd`) used to hang the
     evaluator until KernelBot's mode timeout killed it with no result at all;
-    it now fails in 55 s with "the submission did not return from 'untimed'
-    within 50 s".
+    on the A100 it failed in 157 s with "the submission did not return from
+    'untimed' within 150 s" (`warmup_max_call_ms` 120 s plus 30 s), inside the
+    300 s mode timeout. Since 1.1.1 every per-command deadline is additionally
+    clamped to what is left of the mode's budget (section 10).
 
 **Parameters added to `task.yml` / `bands.json`**
 
@@ -718,3 +734,75 @@ environment forwarding into the container:
 `redteam/io-and-process_gpurecon.py` (identical, plus a stderr dump of the recon
 dictionary) and `redteam/threshold-gaming_edge_gpufd.py` (`REDTEAM_EDGE`
 defaults to `fd`).
+
+## 10. Changes from the 1.1.0 audit (harness 1.1.1)
+
+An independent audit of 1.1.0 found one defect that made the published number
+non-secret and two hosting-path gaps that no GPU run had exercised. All three
+are fixed here; the rest of the pass was documentation drift.
+
+**1. The ranked run now always has a secret seed.** `main()` read
+`POPCORN_SEED` and, when it was absent, silently fell back to the *public* case
+seed in `task.yml`. That is the hosted path, not a hypothetical: KernelBot's
+participant-visible run is submitted with `seed=None`
+(`backend.py:submit_leaderboard`), `run_eval.py` sets `POPCORN_SEED` only when a
+seed is given, and the leaderboard ranks on the non-secret run
+(`leaderboard_db.py`, `AND NOT r.secret`). Every draw, every per-draw label
+permutation and every hold-out position of the published run would therefore
+have been reproducible offline from the public `task.yml`, the public `eval.py`
+and the public 60k MNIST split. `eval.py` now draws its own secret with
+`os.urandom(8)` when the host supplies none, and logs `system.seed_source`
+(`popcorn` or `random`) so an operator can see which happened. Failing hard was
+the stricter alternative but it would break `popcorn submit --mode test`.
+
+**2. `profile` mode now meets the NVIDIA contract.** reference-kernels'
+`docs/ncu-profiling.md` is explicit that accepting `profile` and running
+`torch.profiler` is not enough: the runner wraps the evaluator in
+`ncu --nvtx --nvtx-include 'custom_kernel/'` with `POPCORN_NCU=1` and fails the
+run if no report comes out. When `POPCORN_NCU=1`, the child now makes one call
+inside `torch.cuda.nvtx.range("custom_kernel")` with the synchronize inside the
+range and validation outside, and torch.profiler is not started (the two
+profilers compete). Every mode logs `benchmark.{i}.status`. This path has still
+never run under a real `ncu`: `run_modal.py` does not invoke it.
+
+**3. Module level must be inert.** KernelBot compiles a Python submission by
+*running* it once (`python3 submission.py`) in the work directory, before
+`eval.py` starts -- outside the network guard, the private submission
+directory, the `sys.path` scrub and the re-exec. Module-level code could
+therefore fetch the public MNIST labels, or simply `import mnist_data`, stash
+the table under a name the dataset-open guard does not match, and read it back
+from inside `custom_kernel`. `check_submission_source` now rejects any
+module-level statement other than an import, a `def`, a `class`, a constant
+assignment (any expression built only from literals and operators) and a short
+allowlist of `torch` configuration calls and `torch.*` flag assignments. All
+four reference entries pass unchanged; 17 of the 29 red-team files do not, so
+`tests/GPU_CHECKS.md` now says their recorded verdicts predate this check.
+Worth raising with Mark: whether the compile step can be skipped for `lang: py`
+problems that do not use `load_inline`.
+
+**4. Per-command deadlines are budgeted against the mode timeout.** The
+startup, calibration, `load` and warm-up deadlines were fixed and independent,
+so a submission could burn 149 s in `load` and 149 s in the warm-up and run the
+300 s `test` timeout out, leaving KernelBot with a bare `TIMEOUT` and no
+`check` line -- the exact failure change #15 was written to prevent (the real
+board had only 143 s of margin). `task.yml` now carries `test_timeout`,
+`benchmark_timeout` and `ranked_timeout` as case fields as well, each mode takes
+a wall deadline on entry, and `Child.call` clamps every per-command deadline to
+what is left of it minus a 30 s reserve. The harness therefore always gets to
+emit `check: fail`.
+
+**5. Generated files that used to drift.** `make_bands.py` now also rewrites the
+band table inside `README.md` and one `<band>/submission.py` per band, so
+`--check` catches a stale README (it did not before) and a participant who
+downloads the 12% template no longer posts to the 5% board.
+
+**6. Smaller corrections.** The per-draw floor is skipped when a mode runs a
+single draw, where it is redundant with the aggregate rule and named the wrong
+cause; `run_modal.py` gained `--env K=V` and now runs KernelBot's compile step
+(`python3 submission.py`) before the evaluator, so the hosted sequence is
+exercised; `utils.clear_l2_cache` and `mnist_data.source_permutations` were dead
+copies of logic that lives in `eval.py` and are deleted; `system.driver` is read
+properly; the README's CPU smoke-test command used a band the baseline cannot
+clear; two "current board" rows quoted numbers from a different band's result
+and now say "not run"; `tests/test_web.py` skips without `fastapi`; and
+`bands.json` no longer says the hold-out floor is CPU-only calibration.

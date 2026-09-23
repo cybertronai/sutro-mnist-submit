@@ -36,6 +36,9 @@ class TestSpec(TypedDict):
                        ratio; an honest learner does the same work every call
     max_source_bytes   size limit on submission.py (rule 2, machine-checked)
     max_literal_bytes  size limit on any one string or bytes literal in it
+    test_timeout       the mode timeouts KernelBot enforces, repeated here so
+    benchmark_timeout  the evaluator can clamp each per-command deadline to the
+    ranked_timeout     budget it has left and always report a failure itself
     """
 
     size: int
@@ -54,3 +57,6 @@ class TestSpec(TypedDict):
     dispersion_x10: int
     max_source_bytes: int
     max_literal_bytes: int
+    test_timeout: int
+    benchmark_timeout: int
+    ranked_timeout: int

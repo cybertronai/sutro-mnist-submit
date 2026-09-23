@@ -1,5 +1,5 @@
 > **Note for this repository.** This is the evaluator's own README, copied from
-> `cybertronai/sutro-problems/gpumode` at harness version 1.1.0 (2026-09-23). The
+> `cybertronai/sutro-problems/gpumode` at harness version 1.1.1 (2026-09-23). The
 > `redteam/` directory it refers to stays in that repository and is not included
 > here; everything else it lists is present. For deploying the hosted submission
 > site, start at [README.md](README.md) and [DEPLOY.md](DEPLOY.md).
@@ -50,7 +50,10 @@ popcorn submit --mode leaderboard submission.py  # the ranked run
 ```
 
 Start from [`submission.py`](submission.py), which ships the nearest-class-mean
-baseline as its body.
+baseline as its body. Each band folder holds the same file with its own
+`#!POPCORN leaderboard` line (`mnist-medium-12pct/submission.py`, and so on);
+that is the copy KernelBot serves as the template, so a downloaded template
+always posts to the board it came from.
 
 ## How it is scored
 
@@ -108,13 +111,17 @@ checks.
 | `mnist-medium-8pct` | 8% | 101,200 / 110,000 | 11 |
 | `mnist-medium-12pct` | 12% | 96,800 / 110,000 | 11 |
 
+<!-- END GENERATED -->
+
 The bands are one file, [`bands.json`](bands.json); `python make_bands.py`
 regenerates every `task.yml` from it.
 
 ### Current board
 
-Measured on one A100-SXM4-40GB, harness 1.1.0, full leaderboard runs. These are
-the reference entries in [`submissions/`](submissions/), not records: nobody has
+Measured on one A100-SXM4-40GB, harness 1.1.0, full leaderboard runs, each row
+with the result JSON behind it. Rows marked "not run" are entries that qualify
+arithmetically on an easier band but have not been measured there. These are the
+reference entries in [`submissions/`](submissions/), not records: nobody has
 competed yet.
 
 | Band | Best entry | Mean ms | Accuracy | Hold-out | Result |
@@ -122,8 +129,8 @@ competed yet.
 | 2% | none yet | | | | `cg_pair` misses at 97.93% |
 | 3% | `submissions/cg_pair.py` | 270.18 | 97.93% | 88.2% | [`results/gpu-03b-cg-pair-3pct-leaderboard.json`](results/gpu-03b-cg-pair-3pct-leaderboard.json) |
 | 5% | `submissions/pca_qda.py` | 4.55 | 95.35% | 78.0% | [`results/gpu-02-pca-qda-5pct-leaderboard.json`](results/gpu-02-pca-qda-5pct-leaderboard.json) |
-| 8% | `submissions/pca_qda.py` | 4.55 | 95.35% | 78.0% | same entry, easier band |
-| 12% | `submissions/pca_qda.py` | 4.55 | 95.35% | 78.0% | same entry, easier band |
+| 8% | `submissions/pca_qda.py` (not run) | | | | clears 5%, so it clears this band |
+| 12% | `submissions/pca_qda.py` (not run) | | | | clears 5%, so it clears this band |
 
 Nearest class mean (`submissions/ncm_baseline.py`, 1.09 ms, about 80%) meets no
 band. `submissions/mlp512.py` clears 5% on accuracy (96.4%) but fails the
@@ -150,6 +157,10 @@ a tie.
    extractor is not. Machine-checked: `submission.py` may not exceed 20,480
    bytes and no single literal may exceed 4,096 bytes, which is far less than
    the public pool compresses to. Every reference entry here is under 6 KB.
+   Module level must also be inert -- only imports, `def`, `class`, constants
+   and `torch` configuration calls -- because the host compiles a Python
+   submission by running it once, before the evaluator starts and outside every
+   guard below. Do your work inside `custom_kernel`.
 3. **No network access.** The scored container is run with egress denied, and
    inside the submission's process an audit hook refuses `socket.connect`,
    `getaddrinfo` and `urllib`, plus any attempt to open a file that looks like a
@@ -175,12 +186,18 @@ python run_modal.py --band mnist-medium-5pct --submission submissions/pca_qda.py
     --mode leaderboard --seed 12345 --output results/pca-qda.json
 
 # the same pipeline on a CPU, no GPU and no Modal account needed
-python run_modal.py --band mnist-medium-5pct --submission submissions/ncm_baseline.py \
+python run_modal.py --band mnist-medium-12pct --submission submissions/ncm_baseline.py \
     --mode test --local --case train=2000 --case test=2000
 
 # the evaluator directly, the way KernelBot invokes it
 POPCORN_FD=9 POPCORN_SEED=12345 python eval.py benchmark cases.txt 9>results.txt
 ```
+
+`--case KEY=VALUE` overrides a case field and `--env KEY=VALUE` sets an
+environment variable for the evaluator, locally and inside the container. Both
+runs begin with the host's own compile step (`python3 submission.py`), so a
+submission that does work at import time fails here exactly as it would on the
+board.
 
 `--local` runs the identical protocol with `perf_counter` in place of CUDA
 events and no L2 flush. Set `MNIST_POOL_CACHE` to a directory of verified
@@ -240,7 +257,7 @@ which five agents attacked it (their submissions are in `redteam/`):
 | --- | --- |
 | `eval.py` | the evaluator: draws, timing, scoring, trust boundary |
 | `task.py` | input and output types, and every case field |
-| `utils.py` | seeding, L2 flush, accuracy rule, timing gate, network guard |
+| `utils.py` | seeding, accuracy rule, timing gate, network guard, version info (the L2 flush lives in `eval.py`, on pre-captured references) |
 | `mnist_data.py` | verified MNIST and Fashion-MNIST loading and downsampling |
 | `reference.py`, `submission.py` | the baseline learner and the template |
 | `bands.json`, `make_bands.py` | thresholds, and the generator for `task.yml` |

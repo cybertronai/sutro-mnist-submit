@@ -218,6 +218,41 @@ def run_one(work: Path, mode: str, cases_text: str, timeout: int, seed: int, env
     }
 
 
+def compile_submission(work: Path, env_extra: dict, timeout: int = 180) -> dict:
+    """KernelBot compiles a Python submission by running it once, before eval.py.
+
+    run_eval.run_pytorch_script executes ``python3 submission.py`` in the work
+    directory ahead of the evaluator, outside every guard eval.py installs. The
+    module-level inertness check makes that step inert, and running it here is
+    what keeps the hosted sequence honest in our own runs.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("POPCORN_")}
+    env.update(env_extra)
+    started = time.perf_counter()
+    try:
+        done = subprocess.run(
+            [sys.executable, "submission.py"],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout,
+            start_new_session=True,
+        )
+        code, stdout, stderr = done.returncode, done.stdout, done.stderr
+    except subprocess.TimeoutExpired as error:
+        code, stdout, stderr = -1, error.stdout or "", error.stderr or ""
+    return {
+        "mode": "compile",
+        "exit_code": code,
+        "duration_s": round(time.perf_counter() - started, 2),
+        "passed": code == 0,
+        "result": {"check": "pass" if code == 0 else "fail"},
+        "stdout": (stdout or "")[-8000:],
+        "stderr": (stderr or "")[-8000:],
+    }
+
+
 def evaluate(sources: dict[str, str], task: dict, mode: str, overrides: dict, seed: int,
              env_extra: dict, work_root: str | None = None,
              pool_bytes: dict | None = None) -> dict:
@@ -244,6 +279,9 @@ def evaluate(sources: dict[str, str], task: dict, mode: str, overrides: dict, se
         work = Path(directory)
         for name, contents in sources.items():
             (work / name).write_text(contents)
+        runs["compile"] = compile_submission(work, env_extra)
+        if not runs["compile"]["passed"]:
+            return {"runs": runs, "passed": False}
         for step in sequence:
             cases_text = tests if step == "test" else ranked
             runs[step] = run_one(
@@ -294,7 +332,8 @@ if _modal is not None:
     @app.function(
         gpu=GPU, timeout=MODAL_TIMEOUT, max_containers=1, block_network=BLOCK_NETWORK
     )
-    def remote_evaluate(sources: dict, task: dict, mode: str, overrides: dict, seed: int) -> dict:
+    def remote_evaluate(sources: dict, task: dict, mode: str, overrides: dict, seed: int,
+                        env_extra: dict | None = None) -> dict:
         """Runs inside the container: the same evaluate() this file uses locally."""
         # Lift the baked pool into RAM and remove it from the image's filesystem
         # before anything else happens in this container.
@@ -302,7 +341,8 @@ if _modal is not None:
         pool_bytes = {path.name: path.read_bytes() for path in sorted(baked.glob("*.gz"))}
         shutil.rmtree(baked, ignore_errors=True)
         payload = evaluate(
-            sources, task, mode, overrides, seed, {}, work_root="/tmp", pool_bytes=pool_bytes
+            sources, task, mode, overrides, seed, env_extra or {},
+            work_root="/tmp", pool_bytes=pool_bytes,
         )
         try:
             import torch
@@ -314,7 +354,7 @@ if _modal is not None:
         return payload
 
 
-def run_on_modal(sources, task, mode, overrides, seed):
+def run_on_modal(sources, task, mode, overrides, seed, env_extra=None):
     """One A100, one container, patient about capacity."""
     if _modal is None:
         raise SystemExit("modal is not installed; use --local or pip install modal")
@@ -323,7 +363,9 @@ def run_on_modal(sources, task, mode, overrides, seed):
     while True:
         try:
             with _modal.enable_output(), app.run():
-                return remote_evaluate.remote(sources, task, mode, overrides, seed)
+                return remote_evaluate.remote(
+                    sources, task, mode, overrides, seed, env_extra or {}
+                )
         except Exception as error:
             message = str(error).lower()
             transient = any(
@@ -355,6 +397,9 @@ def main() -> int:
                         help="MNIST_EVAL_DEVICE for --local; defaults to cpu")
     parser.add_argument("--pool-cache", default=os.environ.get("MNIST_POOL_CACHE"),
                         help="directory of verified idx.gz files, for offline local runs")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                        help="extra environment variable for the evaluator process; "
+                             "forwarded into the Modal container too")
     parser.add_argument("--case", action="append", default=[], metavar="KEY=VALUE",
                         help="override a case field, e.g. --case draws=2")
     args = parser.parse_args()
@@ -374,15 +419,21 @@ def main() -> int:
         key, _, value = item.partition("=")
         overrides[key.strip()] = int(value)
 
+    env_extra = {}
+    for item in args.env:
+        key, _, value = item.partition("=")
+        env_extra[key.strip()] = value
+
     started = time.time()
     if args.local:
         env = {"MNIST_EVAL_DEVICE": args.device or "cpu"}
         if args.pool_cache:
             env["MNIST_POOL_CACHE"] = str(Path(args.pool_cache).resolve())
+        env.update(env_extra)
         payload = evaluate(sources, task, args.mode, overrides, args.seed, env)
         payload["gpu"] = env["MNIST_EVAL_DEVICE"]
     else:
-        payload = run_on_modal(sources, task, args.mode, overrides, args.seed)
+        payload = run_on_modal(sources, task, args.mode, overrides, args.seed, env_extra)
 
     payload.update(
         band=args.band,
@@ -391,6 +442,7 @@ def main() -> int:
         mode=args.mode,
         seed=args.seed,
         overrides=overrides,
+        env=env_extra,
         where="local" if args.local else "modal",
         wall_s=round(time.time() - started, 1),
     )

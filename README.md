@@ -43,7 +43,7 @@ scripts/smoke.py      submit a kernel to a deployed site and wait for the verdic
 tests/test_web.py     41 unit tests for the site (no Modal account, no GPU needed)
 tests/test_eval.py    the evaluator's own unit tests
 eval.py, utils.py, mnist_data.py, task.py, reference.py, submission.py
-                      the evaluator harness (version 1.1.0) and the kernel template
+                      the evaluator harness (version 1.1.1) and the kernel template
 run_modal.py          the harness's standalone runner; the site reuses its Modal image and evaluate()
 mnist-medium-*/       one task.yml per accuracy band (generated from bands.json by make_bands.py)
 submissions/          reference kernels: ncm_baseline, pca_qda, mlp512, cg_pair
@@ -75,6 +75,7 @@ check; see HARNESS.md).
 | `mnist-medium-8pct` | 8% | 101,200 / 110,000 | 11 |
 | `mnist-medium-12pct` | 12% | 96,800 / 110,000 | 11 |
 
+<!-- END GENERATED -->
 ## Status at snapshot time (2026-09-23)
 
 - Deployed and verified in the `yaroslavvb` Modal workspace as app

@@ -82,7 +82,16 @@ DEFAULTS = {
     "dispersion_x10": 20,
     "max_source_bytes": 20480,
     "max_literal_bytes": 4096,
+    "test_timeout": 300,
+    "benchmark_timeout": 600,
+    "ranked_timeout": 1200,
 }
+
+# The host kills the whole evaluator when the mode's timeout passes, and then
+# records a bare TIMEOUT with no ``check`` line. Every per-command deadline is
+# therefore clamped to what is left of the mode's budget, minus this reserve
+# for reporting the failure, so the harness always gets to say what went wrong.
+MODE_RESERVE_S = 30.0
 
 # Seed offsets, so warm-up, timed and hold-out draws never coincide.
 WARMUP_OFFSET = 7
@@ -192,6 +201,117 @@ def check_submission_source(case, path="submission.py"):
                     f"submission.py contains a {len(node.value)}-byte literal, over the "
                     f"{literal_limit}-byte limit; entries may not carry embedded data (rule 2)"
                 )
+    check_module_level_is_inert(tree)
+
+
+# Module scope may call these: they configure torch and read nothing.
+INERT_MODULE_CALLS = frozenset(
+    {
+        "torch.set_float32_matmul_precision",
+        "torch.set_default_dtype",
+        "torch.set_grad_enabled",
+        "torch.set_num_threads",
+        "torch.manual_seed",
+        "torch.cuda.manual_seed",
+        "torch.cuda.manual_seed_all",
+        "torch.use_deterministic_algorithms",
+    }
+)
+
+
+def dotted_name(node):
+    """``torch.backends.cuda.matmul.allow_tf32`` -> that string, or None."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def check_module_level_is_inert(tree):
+    """Reject module-level code that runs outside the trust boundary.
+
+    KernelBot compiles a Python submission by *running* it once
+    (``python3 submission.py``) in the work directory, before eval.py starts:
+    no network guard, no private directory, the harness modules next door. Any
+    module-level statement therefore executes where none of this harness's
+    defences exist, and could stash the public labels somewhere for
+    ``custom_kernel`` to read back later. Restricting module scope to imports,
+    definitions, literal constants and a short list of torch configuration
+    calls makes that compile step inert; everything a submission actually does
+    then happens inside ``custom_kernel``, inside the guarded child.
+    """
+    allowed = (
+        ast.Import,
+        ast.ImportFrom,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Pass,
+    )
+    for node in tree.body:
+        if isinstance(node, allowed):
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue  # the module docstring
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value
+            name = dotted_name(call.func)
+            if name in INERT_MODULE_CALLS and all(
+                _is_literal(argument) for argument in call.args
+            ) and all(_is_literal(keyword.value) for keyword in call.keywords):
+                continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and _is_literal(node.value):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if all(_assignable(target) for target in targets):
+                continue
+        raise Failure(
+            f"submission.py runs code at module level (line {node.lineno}); only imports, "
+            "def, class, literal constants and torch configuration calls are allowed "
+            "there, because the host compiles the file by executing it outside the "
+            "evaluator's sandbox. Move the work inside custom_kernel."
+        )
+
+
+# Expression nodes that cannot read, call or import anything: a value built
+# only from these is a constant, however it is spelled ((1 << 40) - 1 included).
+CONSTANT_NODES = (
+    ast.Constant,
+    ast.Tuple,
+    ast.List,
+    ast.Dict,
+    ast.Set,
+    ast.UnaryOp,
+    ast.BinOp,
+    ast.BoolOp,
+    ast.Compare,
+    ast.IfExp,
+    ast.expr_context,
+    ast.operator,
+    ast.unaryop,
+    ast.boolop,
+    ast.cmpop,
+)
+
+
+def _is_literal(node):
+    """True when ``node`` is a compile-time constant expression."""
+    if node is None:
+        return False
+    return all(isinstance(child, CONSTANT_NODES) for child in ast.walk(node))
+
+
+def _assignable(target):
+    """A plain name, a tuple of names, or a ``torch.*`` configuration flag."""
+    if isinstance(target, ast.Name):
+        return True
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return all(_assignable(element) for element in target.elts)
+    name = dotted_name(target)
+    return bool(name) and name.startswith("torch.")
 
 
 def prepare_submission_dir():
@@ -500,6 +620,33 @@ def child_main(connection, device, work_dir):
         del output
         return predictions
 
+    def profile_ncu_call():
+        """One call inside an NVTX range, for Nsight Compute.
+
+        reference-kernels' profiling contract (docs/ncu-profiling.md) is that
+        the runner wraps this process in
+        ``ncu --nvtx --nvtx-include 'custom_kernel/'`` and fails the run if no
+        report comes out, so the range must exist and the synchronize must be
+        inside it. torch.profiler is deliberately *not* started here: the two
+        profilers compete for the same resources.
+        """
+        import torch
+
+        inputs, count = staged_inputs()
+        kernel = state["kernel"]
+        if kernel is None:
+            raise RuntimeError("no submission has been loaded")
+        if device == "cuda":
+            captured_sync()
+            flush_l2()
+            captured_sync()
+        with torch.cuda.nvtx.range("custom_kernel"):
+            output = kernel(inputs)
+            sync()
+        validate(output, count)
+        del output
+        return "nvtx range custom_kernel captured"
+
     def profile_call():
         from torch.profiler import ProfilerActivity, profile
 
@@ -535,6 +682,8 @@ def child_main(connection, device, work_dir):
                 connection.send(("ok", untimed_call(*args)))
             elif command == "profile":
                 connection.send(("ok", profile_call()))
+            elif command == "profile_ncu":
+                connection.send(("ok", profile_ncu_call()))
             elif command == "sysinfo":
                 connection.send(("ok", system_info()))
             else:
@@ -546,7 +695,9 @@ def child_main(connection, device, work_dir):
 class Child:
     """The submission's process, plus the parent-side clock around every call."""
 
-    def __init__(self, device, work_dir, startup_timeout_s=120.0):
+    def __init__(self, device, work_dir, startup_timeout_s=120.0, deadline=None):
+        self.deadline = deadline
+        startup_timeout_s = self.budget(startup_timeout_s, "start")
         context = multiprocessing.get_context("spawn")
         self.connection, remote = context.Pipe()
         self.process = context.Process(
@@ -561,6 +712,17 @@ class Child:
         if status != "ready":
             raise RuntimeError(value)
 
+    def budget(self, timeout_s, command):
+        """Clamp one command's deadline to what is left of the mode's budget."""
+        if self.deadline is None:
+            return timeout_s
+        remaining = self.deadline - time.perf_counter()
+        if remaining <= 0:
+            raise Failure(
+                f"the run ran out of its mode time budget before {command!r}"
+            )
+        return remaining if timeout_s is None else min(timeout_s, remaining)
+
     def call(self, command, *args, timeout_s=None):
         """Send one command and wait for its reply, bounded by ``timeout_s``.
 
@@ -573,6 +735,7 @@ class Child:
         """
         import threading
 
+        timeout_s = self.budget(timeout_s, command)
         started = time.perf_counter()
         self.connection.send((command, args))
         expired = []
@@ -706,7 +869,10 @@ def run_case(child, pools, case, *, timed_draws, holdout, floor_bp):
             int(value) for value in rng.choice(total_calls, holdout_draws, replace=False)
         }
 
-    draw_floor = required_correct(n_test, min(10000, floor_bp))
+    # With a single timed draw the per-draw floor is strictly redundant with
+    # the aggregate accuracy gate, and firing first would report "the ranked
+    # calls are not doing the same work" when the real problem is accuracy.
+    draw_floor = required_correct(n_test, min(10000, floor_bp)) if timed_draws > 1 else 0
     durations_ns, parent_ms_list, child_ms_list, stage_ms_list = [], [], [], []
     parent_stage_ms_list = []
     per_draw, holdout_per_draw, holdout_ms_list = [], [], []
@@ -817,6 +983,17 @@ def run_case(child, pools, case, *, timed_draws, holdout, floor_bp):
 
 # ------------------------------------------------------------------ modes
 
+def mode_deadline(case, mode):
+    """The wall-clock instant by which this mode must have produced a result."""
+    field = {
+        "test": "test_timeout",
+        "benchmark": "benchmark_timeout",
+        "leaderboard": "ranked_timeout",
+        "profile": "benchmark_timeout",
+    }[mode]
+    return time.perf_counter() + case[field] - MODE_RESERVE_S
+
+
 def log_system(out, child):
     try:
         info, _ = child.call("sysinfo", timeout_s=120)
@@ -829,6 +1006,7 @@ def log_system(out, child):
 
 def run_test(out, pools, cases, device):
     out.log("test-count", len(cases))
+    deadline = mode_deadline(cases[0], "test")
     passed = True
     for index, case in enumerate(cases):
         out.log(f"test.{index}.spec", case["spec"])
@@ -836,7 +1014,7 @@ def run_test(out, pools, cases, device):
         work_dir = prepare_submission_dir()
         loose_bp = min(10000, case["error_bp"] + TEST_SLACK_BP)
         try:
-            child = Child(device, work_dir)
+            child = Child(device, work_dir, deadline=deadline)
             if index == 0:
                 log_system(out, child)
             report = run_case(
@@ -880,13 +1058,14 @@ def run_test(out, pools, cases, device):
 
 def run_ranked(out, pools, cases, device, holdout):
     out.log("benchmark-count", len(cases))
+    deadline = mode_deadline(cases[0], "leaderboard" if holdout else "benchmark")
     passed = True
     for index, case in enumerate(cases):
         out.log(f"benchmark.{index}.spec", case["spec"])
         child = None
         work_dir = prepare_submission_dir()
         try:
-            child = Child(device, work_dir)
+            child = Child(device, work_dir, deadline=deadline)
             if index == 0:
                 log_system(out, child)
             use_holdout = bool(holdout and case["holdout"])
@@ -968,12 +1147,13 @@ def run_ranked(out, pools, cases, device, holdout):
 
 def run_profile(out, pools, cases, device):
     out.log("benchmark-count", len(cases))
+    deadline = mode_deadline(cases[0], "profile")
     for index, case in enumerate(cases):
         out.log(f"benchmark.{index}.spec", case["spec"])
         child = None
         work_dir = prepare_submission_dir()
         try:
-            child = Child(device, work_dir)
+            child = Child(device, work_dir, deadline=deadline)
             pool = pools[("mnist", case["size"])]
             universes = split_universes(len(pool[1]), case["seed"], UNIVERSE_SALT)
             visible, _ = make_draw(
@@ -983,11 +1163,16 @@ def run_profile(out, pools, cases, device):
             child.call("load", timeout_s=timeout)
             child.call("untimed", visible, timeout_s=timeout)
             child.call("stage", visible, timeout_s=timeout)
-            report, _ = child.call("profile", timeout_s=timeout)
+            # Under Nsight Compute the runner needs an NVTX range named
+            # custom_kernel and nothing else profiling the process; everywhere
+            # else the torch.profiler table is the useful artefact.
+            command = "profile_ncu" if os.environ.get("POPCORN_NCU") == "1" else "profile"
+            report, _ = child.call(command, timeout_s=timeout)
         finally:
             if child is not None:
                 child.stop()
             shutil.rmtree(work_dir, ignore_errors=True)
+        out.log(f"benchmark.{index}.status", "pass")
         out.log(
             f"benchmark.{index}.report",
             base64.b64encode(report.encode("utf-8"), b"+*").decode("utf-8"),
@@ -1072,16 +1257,28 @@ def main():
         return 2
     mode = sys.argv[1]
     secret = secrets.get("secret")
+    # KernelBot only sets POPCORN_SEED on its extra PRIVATE run; the run whose
+    # time is published and whose gates decide the entry gets no seed at all.
+    # Falling back to the public case seed would make every draw, every label
+    # permutation and every hold-out position reproducible offline from the
+    # public task.yml, so draw our own secret instead.
+    if secret:
+        secret = int(secret)
+        seed_source = "popcorn"
+    else:
+        secret = int.from_bytes(os.urandom(8), "big")
+        seed_source = "random"
     try:
-        cases = read_cases(sys.argv[2], int(secret) if secret else None)
+        cases = read_cases(sys.argv[2], secret)
     except Exception as error:
         print(f"could not read cases: {error}", file=sys.stderr)
         return EXIT_BAD_CASES
-    set_seed(int(secret) % (2**31) if secret else 42)
+    set_seed(secret % (2**31))
     device = resolve_device()
     cache = secrets.get("cache")
     out = PopcornOutput(int(fd))
     os.environ.pop("POPCORN_FD", None)  # the fd is already non-inheritable
+    out.log("system.seed_source", seed_source)
     started = time.perf_counter()
     try:
         check_submission_source(cases[0])

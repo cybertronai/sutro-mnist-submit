@@ -5,11 +5,13 @@ Everything in `tests/test_eval.py` and every red-team re-run behind harness
 branch of `eval.py` -- `torch.cuda.Event`, the 256 MB L2 flush, the two
 `synchronize` barriers around it -- has never executed. Run this list once on
 one A100 before a band opens, and record the numbers next to each row.
+Sections A1-A3 are what to run; sections R1-R3, after the rule, are what the
+first pass actually returned.
 
     python run_modal.py --band <band> --submission <file> --mode <mode> \
         --seed <secret> --output results/gpu-<name>.json
 
-## 1. The harness still works
+## A1. The harness still works
 
 | # | Run | Expect |
 | --- | --- | --- |
@@ -29,7 +31,15 @@ first timed call is not an outlier against the dispersion gate
 (`worst <= 2 * median + 2 ms`) once CUDA graphs and the allocator are involved;
 if a legitimate entry trips it, raise `dispersion_x10` in `bands.json`.
 
-## 2. Red-team files that must still be caught
+## A2. Red-team files that must still be caught
+
+Since harness 1.1.1 the module-level inertness check (rule 2) rejects any file
+that runs code at import time, which is 17 of the 29 files in `redteam/` --
+including every `timer-patch*` variant. They are now caught *before* the
+submission is imported, so re-running them exercises the static check, not the
+runtime defence they were written for. To re-test a runtime defence, move the
+entry's module-level setup into `custom_kernel` first; the verdicts recorded in
+R2 were taken before the static check existed.
 
 | # | File | Mode | Expected verdict |
 | --- | --- | --- | --- |
@@ -43,22 +53,22 @@ if a legitimate entry trips it, raise `dispersion_x10` in `bands.json`.
 | 2.7 | `redteam/replay-cache.py` | leaderboard, 12% | fail on the per-draw floor; confirm the int64 pixel hash is bit-stable across calls on CUDA after the 256 MB flush, i.e. that the exploit fails because the table is empty, not because hashing is noisy |
 | 2.8 | `redteam/replay-cache_weights.py` | leaderboard, 5% | fail on the dispersion gate |
 | 2.9 | `redteam/threshold-gaming.py` | benchmark, 5% | honest time (no warm-up training budget) |
-| 2.10 | `redteam/threshold-gaming_margin11.py` | benchmark, 12%, `--case bench_draws=11` | fail on the per-draw floor |
+| A2.10 | `redteam/threshold-gaming_margin11.py` | benchmark, 12%, `--case bench_draws=11` | fail on the per-draw floor |
 | 2.11 | `redteam/threshold-gaming_clock.py` | benchmark, 12%, `REDTEAM_CLOCK_SCALE=0.001` | honest time |
 | 2.12 | `redteam/label-lookup_fallback.py` | test, 2% | rejected before import: over the 20,480-byte cap |
 | 2.13 | `redteam/label-lookup_netprobe.py` | test, 12% | with `block_network=True`, **all five** channels blocked, including `subprocess curl`. On CPU here four of five were blocked; the fifth is what the container block is for. |
 | 2.14 | `redteam/io-and-process.py` | leaderboard, 12% | fail. Then read `/tmp/redteam-io-recon.json` and check `proc_environ_readable` and `parent_POPCORN_SEED`: on Linux `/proc` exists, and this is the first real test of the re-exec that keeps the secret seed out of the parent's environment. `idx_gz_found` must be empty on a hosted container. |
 | 2.15 | `redteam/threshold-gaming_edge.py` with `REDTEAM_EDGE=fd` | test, 12% | fail with "did not return within N s" after the watchdog kills the process group -- not a mode timeout |
 
-## 3. Things to measure while the GPU is warm
+## A3. Things to measure while the GPU is warm
 
 * Per-call duration spread of each reference submission over 11 draws, to set
-  `draw_slack_bp` (currently 100 bp) and `dispersion_x10` (currently 20) from
+  `draw_slack_bp` (currently 150 bp) and `dispersion_x10` (currently 20) from
   data rather than from CPU dry runs.
 * Fashion-MNIST hold-out accuracy of each reference submission over several
   draws, to set `holdout_min_bp` (currently 3000 bp = 70%) with a real margin.
-  If a legitimate entry lands near 70%, lower it; the number is a policy choice
-  calibrated only on CPU today.
+  If a legitimate entry lands near 70%, lower it; the number is a policy choice.
+  Measured on the A100 in R1/R3: pca-qda 78.0%, cg-pair 88.2%, mlp512 47.8%.
 * Whether `torch==2.12.0` resolves against the `nvidia/cuda:13.3.0` base in
   `run_modal.py`; `TORCH_PIN` is the single place to step back.
 * The cost of the 256 MB L2 flush per call, so it can be quoted in the README.
@@ -79,7 +89,7 @@ were `A100-SXM4-80GB`. The same pca-qda computation ran 4.311 ms on the 80 GB
 board against 4.504-4.547 ms on the 40 GB board: 4.5% faster, about 20x the
 run-to-run spread. A ranked board must pin the variant or record it per entry.
 
-## 1. The harness still works
+## R1. The harness still works
 
 | # | Run | Result |
 | --- | --- | --- |
@@ -108,7 +118,7 @@ Repeatability, pca-qda 5% leaderboard, three secret seeds:
 Spread across containers 0.043 ms = 0.95% of the mean; within a run 0.2-0.35%.
 Accuracy varies 0.33 points across seeds, hold-out 0.6 points.
 
-## 2. Red-team files on real CUDA
+## R2. Red-team files on real CUDA
 
 | # | File | Mode | Verdict on the A100 |
 | --- | --- | --- | --- |
@@ -131,7 +141,7 @@ Nothing escaped. Two exploits that merely came out honest on the CPU are now
 rejected outright on the GPU (2.8 at 20.7x, 2.9 at 10.2x), because real device
 timing separates a trained call from a replayed one much more cleanly.
 
-## 3. Measurements and the two things that need a decision
+## R3. Measurements and the two things that need a decision
 
 **The 256 MB L2 flush is cheap; its first allocation is not.** Steady-state,
 flush + two barriers + the pipe round trip together are the whole

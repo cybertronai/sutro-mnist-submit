@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import random
 
-HARNESS_VERSION = "sutro-mnist-medium-time/1.1.0"
+HARNESS_VERSION = "sutro-mnist-medium-time/1.1.1"
 
 # A100 (40 GB and 80 GB) has a 40 MB L2. Writing 256 MB evicts it several times
 # over and costs under a millisecond at ~1.5 TB/s. KernelBot's AMD harness uses
@@ -218,23 +218,6 @@ def install_network_guard() -> None:
         pass
 
 
-def clear_l2_cache(device: str = "cuda") -> None:
-    """Evict the L2 so every timed call starts from the same cache state."""
-    if device != "cuda":
-        return
-    import torch
-
-    global _L2_BUFFER
-    try:
-        buffer = _L2_BUFFER
-    except NameError:
-        buffer = None
-    if buffer is None or buffer.numel() * buffer.element_size() < L2_FLUSH_BYTES:
-        buffer = torch.empty(L2_FLUSH_BYTES // 4, dtype=torch.float32, device="cuda")
-        globals()["_L2_BUFFER"] = buffer
-    buffer.fill_(0.0)
-
-
 def system_info() -> dict:
     """Versions participants need in order to reproduce a ranked run."""
     info = {"harness": HARNESS_VERSION}
@@ -248,10 +231,22 @@ def system_info() -> dict:
             info["device_count"] = torch.cuda.device_count()
             major, minor = torch.cuda.get_device_capability(0)
             info["capability"] = f"{major}.{minor}"
+            # _cuda_getDriverVersion needs the lazy CUDA init to have run, and
+            # the accessor moved between torch versions; report why it failed
+            # rather than a bare "unknown" (D10 promises the driver version).
             try:
-                info["driver"] = str(torch._C._cuda_getDriverVersion())
-            except Exception:
-                info["driver"] = "unknown"
+                torch.cuda.init()
+            except Exception:  # pragma: no cover - CPU dry runs never get here
+                pass
+            for accessor in (
+                lambda: torch.cuda.driver_version(),
+                lambda: torch._C._cuda_getDriverVersion(),
+            ):
+                try:
+                    info["driver"] = str(accessor())
+                    break
+                except Exception as error:  # pragma: no cover - version dependent
+                    info["driver"] = f"unknown ({type(error).__name__}: {error})"[:120]
         else:
             info["device"] = "cpu"
             info["device_count"] = 0

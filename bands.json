@@ -15,9 +15,9 @@
     "",
     "holdout_draws Fashion-MNIST calls are interleaved with the ranked ones at",
     "secret positions; they are timed and ranked like any other call and must",
-    "clear holdout_min_bp in aggregate. 3000 bp (70%) is calibrated from CPU dry",
-    "runs only (pca_qda 78.9%, nearest class mean 66.5%) and must be re-measured",
-    "on an A100 before a band opens.",
+    "clear holdout_min_bp in aggregate. 3000 bp (70%) is measured on an A100:",
+    "pca_qda 78.0%, the conjugate-gradient pair 88.2%, mlp512 47.8% (which fails,",
+    "and is an honest learner; see the residual risks in README.md).",
     "",
     "Anything else a band may vary lives in defaults/ below and can be",
     "overridden per band with the same keys."

@@ -1,4 +1,4 @@
-#!POPCORN leaderboard mnist-medium-5pct
+#!POPCORN leaderboard mnist-medium-12pct
 #!POPCORN gpu A100
 
 """Template. Replace the body of custom_kernel with your learner.

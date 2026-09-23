@@ -144,19 +144,6 @@ def area_resize(images: np.ndarray, size: int) -> np.ndarray:
     return np.ascontiguousarray(result, dtype=np.float32)
 
 
-def source_permutations(
-    train_count: int = 60000, test_count: int = 10000, seed: int = 20260910
-) -> tuple[np.ndarray, np.ndarray]:
-    """Independently shuffle the official splits, as the repository's tiers do."""
-    train_seed, test_seed = np.random.SeedSequence(seed).spawn(2)
-    train_rng = np.random.Generator(np.random.PCG64(train_seed))
-    test_rng = np.random.Generator(np.random.PCG64(test_seed))
-    return (
-        train_rng.permutation(train_count).astype(np.int64),
-        test_rng.permutation(test_count).astype(np.int64),
-    )
-
-
 def load_pool(raw_dir: Path, dataset: str, size: int) -> tuple[np.ndarray, np.ndarray]:
     """Return (pixels (60000,1,size,size) float32 in [0,1], labels (60000,) int64)."""
     images_key, labels_key = f"{dataset}_train_images", f"{dataset}_train_labels"

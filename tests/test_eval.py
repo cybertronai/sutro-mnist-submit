@@ -9,6 +9,7 @@ bookkeeping.
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -365,3 +366,171 @@ print("secret=%s in_environ=%s" % (payload.get("secret"), "POPCORN_SEED" in os.e
         {"POPCORN_SEED": "20260922"},
     )
     assert output == "secret=20260922 in_environ=False"
+
+
+# ------------------------------------------------------------------ the secret seed of a ranked run
+
+def run_main_and_capture(tmp_path, case_line, secret=None):
+    """Run eval.main() far enough to see which seed it used, and return its keys.
+
+    ``scrub_secret_environment`` is stubbed because its real implementation
+    re-execs the interpreter, which would replace this probe with the shipped
+    eval.py; what is under test is what main() does with what it hands back.
+    """
+    (tmp_path / "submission.py").write_text("def custom_kernel(data):\n    return data[2]\n")
+    (tmp_path / "cases.txt").write_text(case_line + "\n")
+    body = """
+import json
+import os
+import eval as harness
+
+seen = {}
+
+
+def stop(cases, cache, consume=False):
+    seen["seed"] = cases[0]["seed"]
+    raise harness.Failure("stop here")
+
+
+harness.load_pools = stop
+harness.scrub_secret_environment = lambda: json.loads(os.environ.get("PROBE_SECRETS", "{}"))
+read_fd, write_fd = os.pipe()
+os.environ["POPCORN_FD"] = str(write_fd)
+sys.argv = ["eval.py", "test", "cases.txt"]
+code = harness.main()
+try:
+    os.close(write_fd)  # main() closes it through PopcornOutput
+except OSError:
+    pass
+with os.fdopen(read_fd) as handle:
+    lines = handle.read().splitlines()
+print(json.dumps({"code": code, "lines": lines, "seed": seen.get("seed")}))
+"""
+    script = tmp_path / "probe.py"
+    script.write_text(f"import sys\nsys.path.insert(0, {str(HERE.parent)!r})\n" + body)
+    env = dict(os.environ)
+    env.pop("POPCORN_SEED", None)
+    env["PROBE_SECRETS"] = json.dumps({"secret": secret} if secret else {})
+    import subprocess
+
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, env=env,
+        cwd=tmp_path, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+CASE_LINE = "size: 9; train: 10; test: 10; draws: 1; seed: 202"
+
+
+def test_a_ranked_run_without_popcorn_seed_still_draws_a_secret_seed(tmp_path):
+    # KernelBot's participant-visible run -- the one whose time is published --
+    # is submitted with seed=None, so POPCORN_SEED is not in the environment.
+    # Falling back to the public case seed would make every draw, every label
+    # permutation and every hold-out position reproducible offline.
+    first = run_main_and_capture(tmp_path, CASE_LINE)
+    second = run_main_and_capture(tmp_path, CASE_LINE)
+    assert "system.seed_source: random" in first["lines"]
+    assert first["seed"] != 202 and second["seed"] != 202
+    assert first["seed"] != second["seed"]
+    assert first["code"] == harness.EXIT_VALIDATE_FAIL  # load_pools was stubbed out
+
+
+def test_a_supplied_popcorn_seed_is_used_and_reported(tmp_path):
+    result = run_main_and_capture(tmp_path, CASE_LINE, secret="20260922")
+    assert "system.seed_source: popcorn" in result["lines"]
+    assert result["seed"] == combine(202, 20260922)
+
+
+# ------------------------------------------------------------------ module-level inertness
+
+def test_module_level_code_is_rejected(tmp_path):
+    # KernelBot compiles a python submission by running it, before eval.py and
+    # outside every guard this harness installs.
+    case = dict(harness.DEFAULTS)
+    for body in (
+        "import os\nos.system('curl http://example.com')\n",
+        "import mnist_data\nTABLE = mnist_data.load_pool\n",
+        "LABELS = open('train-labels-idx1-ubyte').read()\n",
+    ):
+        path = write_submission(tmp_path, body)
+        with pytest.raises(harness.Failure) as error:
+            harness.check_submission_source(case, path)
+        assert "module level" in str(error.value)
+
+
+def test_module_level_imports_definitions_and_constants_are_allowed(tmp_path):
+    case = dict(harness.DEFAULTS)
+    path = write_submission(
+        tmp_path,
+        '"""doc."""\n'
+        "import torch\n"
+        "from task import input_t\n"
+        "C, D = 10, 81\n"
+        "MASK = (1 << 40) - 1\n"
+        "SHAPES = {'x': [1, 2, 3]}\n"
+        "torch.backends.cuda.matmul.allow_tf32 = False\n"
+        "torch.set_float32_matmul_precision('highest')\n"
+        "class Net:\n    pass\n"
+        "def custom_kernel(data):\n    return data[2]\n",
+    )
+    harness.check_submission_source(case, path)
+
+
+# ------------------------------------------------------------------ mode time budget
+
+def test_every_command_deadline_is_clamped_to_the_mode_budget():
+    # A fixed per-command deadline can run the mode timeout out, and KernelBot
+    # then records a bare TIMEOUT with no check line.
+    child = harness.Child.__new__(harness.Child)
+    child.deadline = time.perf_counter() + 10.0
+    assert child.budget(None, "load") == pytest.approx(10.0, abs=0.5)
+    assert child.budget(150.0, "untimed") == pytest.approx(10.0, abs=0.5)
+    assert child.budget(2.0, "timed") == pytest.approx(2.0, abs=0.5)
+    child.deadline = time.perf_counter() - 1.0
+    with pytest.raises(harness.Failure):
+        child.budget(150.0, "untimed")
+
+
+def test_mode_deadlines_come_from_the_case_fields():
+    case = dict(harness.DEFAULTS, test_timeout=300, benchmark_timeout=600, ranked_timeout=1200)
+    now = time.perf_counter()
+    assert harness.mode_deadline(case, "test") - now == pytest.approx(270, abs=1)
+    assert harness.mode_deadline(case, "benchmark") - now == pytest.approx(570, abs=1)
+    assert harness.mode_deadline(case, "leaderboard") - now == pytest.approx(1170, abs=1)
+
+
+def test_task_yml_timeouts_and_case_timeouts_agree():
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    for band in config["bands"]:
+        task = (HERE.parent / band["name"] / "task.yml").read_text()
+        top = {
+            line.split(":")[0]: int(line.split(":")[1])
+            for line in task.splitlines()
+            if line.startswith(("test_timeout", "benchmark_timeout", "ranked_timeout"))
+        }
+        cases = [json.loads(line[4:]) for line in task.splitlines()
+                 if line.startswith("  - {") and "error_bp" in line]
+        for fields in cases:
+            for key, value in top.items():
+                assert fields[key] == value
+
+
+# ------------------------------------------------------------------ per-band templates
+
+def test_each_band_ships_a_template_naming_its_own_board():
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    shared = (HERE.parent / "submission.py").read_text().splitlines()
+    for band in config["bands"]:
+        template = (HERE.parent / band["name"] / "submission.py").read_text().splitlines()
+        assert template[0] == f"#!POPCORN leaderboard {band['name']}"
+        assert template[1:] == shared[1:]
+        assert f'Python: "submission.py"' in (HERE.parent / band["name"] / "task.yml").read_text()
+
+
+def test_make_bands_check_notices_a_stale_readme(tmp_path):
+    config = json.loads((HERE.parent / "bands.json").read_text())
+    rendered = make_bands.render(config)
+    assert "README.md" in rendered
+    assert make_bands.README_END in rendered["README.md"]
